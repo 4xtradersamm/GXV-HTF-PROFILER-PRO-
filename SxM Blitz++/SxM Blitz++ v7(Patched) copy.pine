@@ -1,0 +1,2874 @@
+//@version=6
+indicator("SxM Blitz++v7 (Patched) copy", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+import GXVSanctuary/AssetCorrelationUtils/5 as GXV
+
+// =============================================================================
+// SxM Blitz++ — PATCHED BUILD
+// -----------------------------------------------------------------------------
+// Timezone            : UTC-offset input (manual DST switch), single owner
+// Core time/hierarchy : one comparative fractal engine (fixes dual-engine bug)
+// Dividers            : exactly 2 sources (primary + parent) — no extras
+// Dealing Range/TrueOpen: fixed session/day-of-week/week/month anchors per your spec
+// Trend Engine        : MACD + Premium/Discount + True Open, majority vote
+// SSMT                : v1-style line-between-pivots, session-tagged, pair filter
+// tCISD               : arms from SSMT OR Turtle Soup, anchors at REFERENCE candle,
+//                       fixed 3-bar extension, gated + cancelled by Trend Engine
+// Turtle Soup / HTF SSMT / Auto Symbols / Alerts : carried over unchanged
+// Dashboard           : fractal Time + True-Open row (v3) PLUS QT cycle/quarter
+//                       label row (v2-style), on the same table
+// =============================================================================
+
+
+// =============================================================================
+// 1. TIMEZONE — MANUAL UTC OFFSET (single owner, DST-safe by design)
+// =============================================================================
+//
+// Rather than an IANA zone name (which is what produced the Azores-default /
+// session-mislabeling bugs in earlier builds), this uses a plain UTC-offset
+// number that you flip by hand between DST states:
+//   -5.0  = Eastern Standard Time  (early Nov – early Mar)
+//   -4.0  = Eastern Daylight Time  (mid Mar – early Nov)
+// The offset is pure arithmetic on the UTC epoch, so every downstream
+// calendar read (day/week/month/quarter/year) rolls over correctly with no
+// special-casing required.
+// =============================================================================
+
+string G_TZ = "Timezone"
+
+float utcOffsetHours = input.float(
+     -4.0,
+     "EST/EDT UTC Offset (hours) — set -4 in Daylight Time, -5 in Standard Time",
+     minval=-12,
+     maxval=14,
+     step=0.5,
+     group=G_TZ)
+
+int offsetMs = int(utcOffsetHours * 3600000)
+int estTime  = time + offsetMs
+
+int eY   = year(estTime, "UTC")
+int eM   = month(estTime, "UTC")
+int eD   = dayofmonth(estTime, "UTC")
+int eH   = hour(estTime, "UTC")
+int eMin = minute(estTime, "UTC")
+int eDow = dayofweek(estTime, "UTC")
+
+// ---- Shared "trading day" clock: shifted 6h so 18:00 EST -> next day 00:00.
+//      Used everywhere a "Day" concept (newDay/newWeek, day labels, dividers,
+//      Dealing Range, True Opens) needs the real futures/forex daily open
+//      instead of midnight. eM/eY (month/quarter/year boundaries) stay on the
+//      plain calendar clock below — those don't shift with the daily session.
+int tradingTime = estTime + 21600000   // shift 6h: 18:00 EST -> next day 00:00
+int tD   = dayofmonth(tradingTime, "UTC")
+int tDow = dayofweek(tradingTime, "UTC")
+
+
+// =============================================================================
+// 2. CORE CALENDAR + SESSION + 90-MINUTE ENGINE (single source of truth)
+// =============================================================================
+
+int totalMin   = eH * 60 + eMin
+int shiftedMin = (totalMin - 1080 + 1440) % 1440     // 1080 = 18:00, the Asia open
+int sessIdx0   = int(shiftedMin / 360)
+int sessionNum = sessIdx0 + 1
+int subQIdx0   = int((shiftedMin % 360) / 90)
+int subQNum    = subQIdx0 + 1
+
+string sessAbbrev = sessIdx0 == 0 ? "ASIA" : sessIdx0 == 1 ? "UK" : sessIdx0 == 2 ? "NYAM" : "NYPM"
+
+string dayName3 =
+     tDow == dayofweek.sunday    ? "SUN" :
+     tDow == dayofweek.monday    ? "MON" :
+     tDow == dayofweek.tuesday   ? "TUE" :
+     tDow == dayofweek.wednesday ? "WED" :
+     tDow == dayofweek.thursday  ? "THU" :
+     tDow == dayofweek.friday    ? "FRI" : "SAT"
+
+// ---- Boundary flags (comparative only — never timeframe.change(), never a
+//      precomputed future timestamp) ----
+bool newSubQ    = na(subQNum[1])   or subQNum   != subQNum[1]
+bool newSession = na(sessionNum[1]) or sessionNum != sessionNum[1]
+bool newDay     = na(tD[1]) or tD != tD[1]
+bool newWeek    = newDay and tDow == dayofweek.monday
+// FIX: was `newDay and eD == 1` — an exact match on calendar day-of-month.
+// On a 1D chart with a weekend/holiday gap, or on a 1W+ chart (bars almost
+// never land exactly on day 1), no bar ever satisfies eD==1, so newMonth
+// (and everything gated by it — weekOfMonth's reset, monthOfQuarter,
+// quarterOfYear, Dealing Range, dividers, True Opens) could silently never
+// fire, freezing weekOfMonth at whatever it last reached. Detecting "the
+// month NUMBER differs from the previous bar" instead is robust to gaps —
+// the same bar-to-bar-difference approach already used for newDay/newWeek.
+bool newMonth   = na(eM[1]) or eM != eM[1]
+bool newQuarter = newMonth and (eM == 1 or eM == 4 or eM == 7 or eM == 10)
+bool newYear    = newMonth and eM == 1
+
+// ---- Counters ----
+// weekOfMonth stays stateful (Monday-counting) — it can't be made fully
+// stateless without a first-day-of-month weekday calculation. A 5th real
+// Monday in a month folds into Week4 (same convention already used for
+// Friday+weekend folding into Thursday's Q4).
+var int weekOfMonth = 1
+
+if newMonth
+    weekOfMonth := 1
+else if newWeek
+    weekOfMonth := math.min(weekOfMonth + 1, 4)
+
+// monthOfQuarter/quarterOfYear are pure calendar math, recomputed every bar
+// — stateless, so they can't drift if a newMonth/newQuarter flag is ever
+// missed (holiday gap, feed gap, etc.).
+int monthOfQuarter = ((eM - 1) % 3) + 1
+int quarterOfYear  = ((eM - 1) / 3) + 1
+
+
+// =============================================================================
+// 3. TIMEFRAME HIERARCHY RESOLVER — ONE resolver, feeds dividers + labels only
+//    (Dealing Range and True-Open use their own fixed anchors — Section 5/7)
+// =============================================================================
+
+float chartSeconds = timeframe.in_seconds(timeframe.period)
+
+bool   primaryNew       = false
+bool   parentNew        = false
+string primaryLabelText = ""
+string cycleName        = ""
+
+if chartSeconds <= 300                                     // ≤5m
+    primaryNew       := newSubQ
+    parentNew        := newSession
+    primaryLabelText := "Q" + str.tostring(subQNum)
+    cycleName        := "90 Minute"
+else if chartSeconds <= 900                                // ≤15m
+    primaryNew       := newSession
+    parentNew        := newDay
+    primaryLabelText := sessAbbrev
+    cycleName        := "6 Hour (Session)"
+else if chartSeconds <= 3600                                // ≤1H
+    primaryNew       := newDay
+    parentNew        := newWeek
+    primaryLabelText := dayName3
+    cycleName        := "Daily"
+else if chartSeconds <= 14400                                // ≤4H
+    primaryNew       := newWeek
+    parentNew        := newMonth
+    primaryLabelText := "W" + str.tostring(weekOfMonth)
+    cycleName        := "Weekly"
+else if chartSeconds <= 86400                                // ≤1D
+    primaryNew       := newMonth
+    parentNew        := newQuarter
+    primaryLabelText := "M" + str.tostring(monthOfQuarter)
+    cycleName        := "Monthly"
+else                                                          // ≥1W
+    primaryNew       := newQuarter
+    parentNew        := newYear
+    primaryLabelText := "QT" + str.tostring(quarterOfYear)
+    cycleName        := "Yearly"
+
+// v2-style cosmetic "Q1..Q4" number for the dashboard's QT row — reuses
+// whichever counter is meaningful at the active bracket.
+int qtQuarterNum =
+     chartSeconds <= 300    ? subQNum :
+     chartSeconds <= 900    ? sessionNum :
+     chartSeconds <= 3600   ? (tDow == dayofweek.monday ? 1 : tDow == dayofweek.tuesday ? 2 : tDow == dayofweek.wednesday ? 3 : 4) :
+     chartSeconds <= 14400  ? math.min(weekOfMonth, 4) :
+     chartSeconds <= 86400  ? monthOfQuarter :
+     quarterOfYear
+
+
+// =============================================================================
+// 4. DIVIDERS — exactly two trigger sources, nothing else draws a divider
+// =============================================================================
+
+string G_DIV = "Dividers"
+
+bool showPrimaryDivider = input.bool(true,  "Show Primary Divider", group=G_DIV)
+bool showParentDivider  = input.bool(true,  "Show Parent Divider",  group=G_DIV)
+bool showPrimaryLabels  = input.bool(true,  "Show Primary Labels",  group=G_DIV)
+
+color primaryDividerColor = input.color(color.new(color.gray, 60),   "Primary Divider Color", group=G_DIV)
+color parentDividerColor  = input.color(color.new(color.red, 30), "Parent Divider Color",  group=G_DIV)
+color primaryLabelColor   = input.color(color.gray, "Primary Label Color", group=G_DIV)
+string dividerStyleInput  = input.string("....", "Divider Line Style", options=["____", "----", "...."], group=G_DIV)
+dividerStyle = dividerStyleInput == "----" ? line.style_dashed : dividerStyleInput == "____" ? line.style_solid : line.style_dotted
+
+if showPrimaryDivider and primaryNew
+    line.new(time, low, time, high, xloc=xloc.bar_time, extend=extend.both, color=primaryDividerColor, style=dividerStyle)
+
+if showParentDivider and parentNew
+    line.new(time, low, time, high, xloc=xloc.bar_time, extend=extend.both, color=parentDividerColor, style=dividerStyle, width=1)
+
+if showPrimaryLabels and primaryNew
+    label.new(time, low, primaryLabelText, xloc=xloc.bar_time, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.black, 100), textcolor=primaryLabelColor, size=size.tiny)
+
+
+// =============================================================================
+// 5. DEALING RANGE — fixed calculation windows per your spec (NOT the generic
+//    "isFirstSub of primary" rule below ≤15m, since you want Asia specifically
+//    on both 5m and 15m charts, not "first 90m of whatever session is active")
+// =============================================================================
+
+string G_DR = "Dealing Range"
+
+bool  showDealingRange   = input.bool(true, "Show Dealing Range", group=G_DR)
+bool  extendDealingRange = input.bool(true, "Extend Through Parent Period", group=G_DR)
+color drColor            = input.color(color.orange, "Dealing Range Color", group=G_DR)
+
+bool drIsFirstSub = false
+bool drParentNew  = false
+
+if chartSeconds <= 300                              // 5m and below — 1st 90-minute Q1 of the active session
+    drIsFirstSub := subQNum == 1
+    drParentNew  := newSession
+else if chartSeconds <= 900                         // 15m — Asia session, always
+    drIsFirstSub := sessionNum == 1
+    drParentNew  := newDay
+else if chartSeconds <= 3600                        // 1H — Monday
+    drIsFirstSub := tDow == dayofweek.monday
+    drParentNew  := newWeek
+else if chartSeconds <= 14400                       // 4H — week 1 of month
+    drIsFirstSub := weekOfMonth == 1
+    drParentNew  := newMonth
+else if chartSeconds <= 86400                       // Daily — resets every month (week 1 of that month)
+    drIsFirstSub := weekOfMonth == 1
+    drParentNew  := newMonth
+else                                                  // Weekly+ — no Dealing Range at this tier
+    drIsFirstSub := false
+    drParentNew  := false
+
+bool drJustLeftFirst = drIsFirstSub[1] and not drIsFirstSub
+
+var float drHigh = na
+var float drLow  = na
+var int   drStart = na
+var line  drHLine = na
+var line  drLLine = na
+
+if drParentNew
+    drHigh  := na
+    drLow   := na
+    drStart := na
+    drHLine := na
+    drLLine := na
+
+if drIsFirstSub
+    drHigh  := na(drHigh) ? high : math.max(drHigh, high)
+    drLow   := na(drLow)  ? low  : math.min(drLow, low)
+    drStart := na(drStart) ? time : drStart
+
+if showDealingRange
+    if drJustLeftFirst and not na(drHigh)
+        drHLine := line.new(drStart, drHigh, time, drHigh, xloc=xloc.bar_time, extend=extend.none, color=drColor, style=line.style_dashed)
+        drLLine := line.new(drStart, drLow,  time, drLow,  xloc=xloc.bar_time, extend=extend.none, color=drColor, style=line.style_dashed)
+    else if extendDealingRange and not na(drHLine) and not drIsFirstSub
+        line.set_x2(drHLine, time)
+        line.set_x2(drLLine, time)
+
+// =============================================================================
+// 6. PREMIUM / DISCOUNT — 50% midpoint of the Dealing Range. This is now the
+//    single PD calculation, feeding only the Trend Engine (Section 8) — the
+//    boundary-based version (close vs. drHigh/drLow) used earlier has been
+//    retired: tCISD no longer has its own separate PD gate (see Section 13),
+//    it requires the Trend Engine to agree instead, and PD is one of the
+//    Trend Engine's three OR'd factors.
+// =============================================================================
+
+float pdEquilibrium = na
+if not na(drHigh) and not na(drLow)
+    pdEquilibrium := (drHigh + drLow) / 2
+bool inDiscount = not na(pdEquilibrium) and close < pdEquilibrium
+bool inPremium  = not na(pdEquilibrium) and close > pdEquilibrium
+
+
+// =============================================================================
+// 7. TRUE OPENS — "shifted" convention per your spec:
+//    Day = unshifted (always 00:00 EST). Week/Month/Quarter/Year = the open
+//    of sub-period #2 of that level's own children (Tuesday / week-2 /
+//    month-2 / April), matching the True-Open sequence you described.
+// =============================================================================
+
+string G_TO = "True Opens"
+
+bool  showTrueOpen  = input.bool(true, "Show Drawn True Open", group=G_TO)
+int   historyCycles = input.int(20, "True Open History Kept", minval=1, maxval=200, group=G_TO)
+color trueOpenColor = input.color(color.gray, "True Open Color", group=G_TO)
+
+// ---- Always-on trackers (TF-independent, feed Trend Engine + Dashboard) ----
+var float dayTrueOpen     = na
+var float weekTrueOpen    = na
+var float monthTrueOpen   = na
+var float quarterTrueOpen = na
+var float yearTrueOpen    = na
+var float sessionOpen     = na   // literal (unshifted) open of the active session
+var float subQ2Open       = na   // session's own TRUE open — shifted to Q2 of its 90-min quarters
+
+// FIX: Day's true open now uses the SAME "2nd child" convention as every
+// other level (Tuesday=2nd day of week, week2=2nd week of month, month2=2nd
+// month of quarter, April=2nd quarter of year, Q2=2nd 90-min-quarter of
+// session). Day's own children are its 4 sessions (Asia/London/NY AM/NY PM),
+// so Day's true open = the 2nd session's open = London's start = 00:00 EST —
+// NOT `newDay` itself (18:00, Asia's start). The Day DIVIDER (newDay, used
+// for MON/TUE/../ labels, week structure, Dealing Range) is untouched and
+// stays on 18:00 — dividers and true opens are deliberately different clocks.
+if newSession and sessionNum == 2
+    dayTrueOpen := open
+if newDay and tDow == dayofweek.tuesday
+    weekTrueOpen := open
+if newWeek and weekOfMonth == 2
+    monthTrueOpen := open
+if newMonth and monthOfQuarter == 2
+    quarterTrueOpen := open
+if newQuarter and quarterOfYear == 2
+    yearTrueOpen := open
+if newSession
+    sessionOpen := open
+if newSubQ and subQNum == 2
+    subQ2Open := open
+
+// ---- Drawn True Open(s) ----
+//   Primary   = the PARENT-of-active-bracket's true open (headline marker
+//               for this chart tier — same design as before).
+//   Secondary = the ACTIVE bracket's own true open, shown alongside the
+//               primary only on the three most-intraday tiers (5m-1m, 15m,
+//               1H-30M). On 4H+ charts only the single parent marker
+//               matters, matching your table — left blank there.
+bool   trueOpenTrigger    = false
+string trueOpenLabelText  = ""
+float  trueOpenPrice      = na
+
+bool   trueOpenTrigger2   = false
+string trueOpenLabelText2 = ""
+float  trueOpenPrice2     = na
+
+if chartSeconds <= 300                                  // 5m and below — parent = Session (shifted → Q2); own = active session's literal open
+    trueOpenTrigger    := newSubQ and subQNum == 2
+    trueOpenLabelText  := "Q2 TO"
+    trueOpenPrice      := subQ2Open
+    trueOpenTrigger2   := newSession
+    trueOpenLabelText2 := "Session Open"
+    trueOpenPrice2     := sessionOpen
+else if chartSeconds <= 900                             // 15m — parent = Day (unshifted, now correctly midnight EST); own = active session's TRUE open (shifted → Q2)
+    trueOpenTrigger    := newSession and sessionNum == 2
+    trueOpenLabelText  := "TDO"
+    trueOpenPrice      := dayTrueOpen
+    trueOpenTrigger2   := newSubQ and subQNum == 2
+    trueOpenLabelText2 := "Session TO"
+    trueOpenPrice2     := subQ2Open
+else if chartSeconds <= 3600                            // 1H-30M — parent = Week (shifted → Tuesday); own = active day's true open (unshifted)
+    trueOpenTrigger    := newDay and tDow == dayofweek.tuesday
+    trueOpenLabelText  := "TWO"
+    trueOpenPrice      := weekTrueOpen
+    trueOpenTrigger2   := newSession and sessionNum == 2
+    trueOpenLabelText2 := "TDO"
+    trueOpenPrice2     := dayTrueOpen
+else if chartSeconds <= 14400                           // 4H-2H — parent = Month (shifted → week 2). HTF chart: no secondary marker.
+    trueOpenTrigger   := newWeek and weekOfMonth == 2
+    trueOpenLabelText := "TMO"
+    trueOpenPrice     := monthTrueOpen
+else if chartSeconds <= 86400                           // Daily — parent = Quarter (shifted → month 2). HTF chart: no secondary marker.
+    trueOpenTrigger   := newMonth and monthOfQuarter == 2
+    trueOpenLabelText := "TQO"
+    trueOpenPrice     := quarterTrueOpen
+else                                                      // Weekly+ — parent = Year (shifted → April). HTF chart: no secondary marker.
+    trueOpenTrigger   := newQuarter and quarterOfYear == 2
+    trueOpenLabelText := "TYO"
+    trueOpenPrice     := yearTrueOpen
+
+var line  drawnTOLine   = na
+var label drawnTOLabel  = na
+var array<line>  toHistLines  = array.new_line()
+var array<label> toHistLabels = array.new_label()
+
+var line  drawnTOLine2   = na
+var label drawnTOLabel2  = na
+var array<line>  toHistLines2  = array.new_line()
+var array<label> toHistLabels2 = array.new_label()
+
+if showTrueOpen
+    if trueOpenTrigger and not na(trueOpenPrice)
+        drawnTOLine  := line.new(time, trueOpenPrice, time, trueOpenPrice, xloc=xloc.bar_time, extend=extend.none, color=trueOpenColor, style=line.style_dotted)
+        drawnTOLabel := label.new(time, trueOpenPrice, trueOpenLabelText, xloc=xloc.bar_time, style=label.style_label_left, color=color.new(color.gray, 100), textcolor=trueOpenColor, size=size.tiny)
+        array.push(toHistLines, drawnTOLine)
+        array.push(toHistLabels, drawnTOLabel)
+        while array.size(toHistLines) > historyCycles
+            line.delete(array.shift(toHistLines))
+            label.delete(array.shift(toHistLabels))
+    else if not na(drawnTOLine)
+        line.set_x2(drawnTOLine, time)
+        label.set_x(drawnTOLabel, time)
+
+    // Secondary marker (intraday tiers only) — faded so it reads as the
+    // lower-priority reference next to the primary headline marker.
+    if trueOpenLabelText2 != ""
+        if trueOpenTrigger2 and not na(trueOpenPrice2)
+            drawnTOLine2  := line.new(time, trueOpenPrice2, time, trueOpenPrice2, xloc=xloc.bar_time, extend=extend.none, color=color.new(trueOpenColor, 45), style=line.style_dotted)
+            drawnTOLabel2 := label.new(time, trueOpenPrice2, trueOpenLabelText2, xloc=xloc.bar_time, style=label.style_label_left, color=color.new(color.gray, 100), textcolor=color.new(trueOpenColor, 45), size=size.tiny)
+            array.push(toHistLines2, drawnTOLine2)
+            array.push(toHistLabels2, drawnTOLabel2)
+            while array.size(toHistLines2) > historyCycles
+                line.delete(array.shift(toHistLines2))
+                label.delete(array.shift(toHistLabels2))
+        else if not na(drawnTOLine2)
+            line.set_x2(drawnTOLine2, time)
+            label.set_x(drawnTOLabel2, time)
+
+
+// =============================================================================
+// 8. TREND ENGINE — MACD state + 50% Premium/Discount + True Open, OR'd
+//    (bullish if ANY of the three agrees — not a majority vote)
+// =============================================================================
+
+string G_TREND = "Trend Engine"
+
+bool enableTrendFilter = input.bool(true, "Enable Trend Filter (SSMT/tCISD)", group=G_TREND)
+
+// Internal momentum leg. Not exposed as inputs — only "Enable Trend Filter"
+// is user-facing; the momentum calculation itself is an implementation detail.
+const int momentumFastLen   = 12
+const int momentumSlowLen   = 26
+const int momentumSignalLen = 9
+
+[macdLine, macdSignalLine, _] = ta.macd(close, momentumFastLen, momentumSlowLen, momentumSignalLen)
+
+bool macdBull = macdLine > macdSignalLine
+bool macdBear = macdLine < macdSignalLine
+bool pdBull   = inDiscount
+bool pdBear   = inPremium
+bool toBull   = not na(trueOpenPrice) and close > trueOpenPrice
+bool toBear   = not na(trueOpenPrice) and close < trueOpenPrice
+
+bool bullishTrend = macdBull or pdBull or toBull
+bool bearishTrend = macdBear or pdBear or toBear
+
+
+// =============================================================================
+// 9. AUTO SYMBOL MAPPING (unchanged from v2/v3)
+// =============================================================================
+
+f_autoSymbols() =>
+    string s1 = ""
+    string s2 = ""
+    string t = str.upper(syminfo.ticker)
+    if str.contains(t, "NQ") or str.contains(t, "MNQ")
+        s1 := "CME_MINI_DL:ES1!"
+        s2 := "CBOT_MINI_DL:YM1!"
+    else if str.contains(t, "ES") or str.contains(t, "MES")
+        s1 := "CME_MINI_DL:NQ1!"
+        s2 := "CBOT_MINI_DL:YM1!"
+    else if str.contains(t, "YM") or str.contains(t, "MYM")
+        s1 := "CME_MINI_DL:ES1!"
+        s2 := "CME_MINI_DL:NQ1!"
+    else if str.contains(t, "RTY") or str.contains(t, "M2K") or str.contains(t, "RUT")
+        s1 := "CME_MINI_DL:ES1!"
+        s2 := "CME_MINI_DL:NQ1!"
+    else if str.contains(t, "BTC")
+        s1 := "ETHUSDT"
+        s2 := "ETHUSD"
+    else if str.contains(t, "ETH")
+        s1 := "BTCUSDT"
+        s2 := "BTCUSD"
+    else if str.contains(t, "EURUSD") or str.contains(t, "6E")
+        s1 := "GBPUSD"
+        s2 := "DXY"
+    else if str.contains(t, "GBPUSD") or str.contains(t, "6B")
+        s1 := "EURUSD"
+        s2 := "DXY"
+    else if str.contains(t, "DXY") or str.contains(t, "DX")
+        s1 := "EURUSD"
+        s2 := "GBPUSD"
+    else if str.contains(t, "XAU") or str.contains(t, "GOLD") or str.contains(t, "GC") or str.contains(t, "MGC")
+        s1 := "XAGUSD"
+        s2 := "DXY"
+    else if str.contains(t, "XAG") or str.contains(t, "SILVER") or str.contains(t, "SI") or str.contains(t, "MSI")
+        s1 := "XAUUSD"
+        s2 := "DXY"
+    else
+        s1 := "CME_MINI_DL:ES1!"
+        s2 := "CBOT_MINI_DL:YM1!"
+    [s1, s2]
+
+
+// =============================================================================
+// 10. SSMT — FULL GXV SMT_Divergences[LITE✦] engine (Gregorius_XV), per your
+//     explicit request to accept the added complexity: real correlation-
+//     library auto pair mapping (Dyad/Triad/Tetrad), all 13 timeframe ranks
+//     computed simultaneously, LIVE→CONFIRMED lifecycle, rank-dominance
+//     arbitration, aesthetic bypass. This supersedes the single-cycle,
+//     chart-timeframe-adaptive version from earlier in this conversation.
+//
+// ATTRIBUTION: © 2026 Gregorius_XV. Original SMT range reconstruction model,
+// deterministic range-key logic, cleanup authority model, Auto Session
+// behavior, Aesthetic Bypass system, and the AssetCorrelationUtils pair
+// resolver, by Gregorius_XV (TradingView: Gregorius_XV). This Pine Script®
+// code is subject to the Mozilla Public License 2.0: https://mozilla.org/MPL/2.0/
+// The library import two lines above (GXVSanctuary/AssetCorrelationUtils/5)
+// is Pine's native library-import mechanism — the same way GXV's own script
+// uses it — not a copy of that library's code.
+//
+// DELIBERATE EXCEPTION to this build's "one clock" rule: this engine keeps
+// GXV's own oracle_tz/session-start-hour clock (`dayStart` etc. below) rather
+// than SxM's EST engine, because the rank system's session/quarter/month/
+// year bucketing is tightly coupled to that clock in the original design.
+// Reimplementing it against SxM's clock would risk silently changing which
+// bucket a bar falls into versus the tested original — accepted per your
+// "use their GXV logic whole" instruction.
+//
+// tCISD WIRING (the one deliberate adaptation): GXV's own script only ever
+// draws/labels SMT events — it has no external "did anything just confirm"
+// signal. `f_smt_run_pair`/`f_run_smt_cycle` below are extended to also
+// return whether a bearish/bullish event finalized (LIVE→CONFIRMED) THIS
+// bar, for enabled ranks/pairs only, aggregated (OR'd) across all 13 ranks
+// into `bearishSSMTEvent`/`bullishSSMTEvent` — the exact same two booleans
+// tCISD (Section 13) already arms from. tCISD's arm-trigger line itself is
+// untouched.
+// =============================================================================
+
+// ---- Legacy sym1/sym2 picker — kept only for Section 11 (HTF SSMT) and the
+//      tCISD reference-candle search below, which still use a single plain
+//      comparison symbol each. The full GXV engine below has its own,
+//      independent multi-pair resolver (smt_corr_pair1/2/3). ----
+string G_SSMT = "SSMT Settings (legacy — feeds HTF SSMT + tCISD reference search)"
+
+int    ssmtLength     = input.int(3, "tCISD Reference Search Offset", minval=2, group=G_SSMT, tooltip="How many bars back Section 11 (HTF SSMT) and the tCISD reference-candle search look. Independent of the full GXV SMT engine below.")
+bool   autoSmtSymbols = input.bool(true, "Auto Symbols (legacy picker)", group=G_SSMT)
+bool   useSym1        = input.bool(true, "Comparison Symbol A", inline="symA", group=G_SSMT)
+string manualSym1     = input.symbol("CME_MINI_DL:ES1!", "", inline="symA", group=G_SSMT)
+bool   useSym2        = input.bool(true, "Comparison Symbol B", inline="symB", group=G_SSMT)
+string manualSym2     = input.symbol("CBOT_MINI_DL:YM1!", "", inline="symB", group=G_SSMT)
+
+[auto_s1, auto_s2] = f_autoSymbols()
+sym1 = autoSmtSymbols ? auto_s1 : manualSym1
+sym2 = autoSmtSymbols ? auto_s2 : manualSym2
+
+// -----------------------------------------------------------------------------
+// ▼▼▼ FULL PORT FROM: GXV SMT_Divergences[LITE✦] — inputs ▼▼▼
+// -----------------------------------------------------------------------------
+
+g_smt = "SMT Visual Settings"
+g_smt_gates = "SMT Gates Settings"
+g_smt_ranks = "SMT Render Settings"
+g_smt_sessions = "SMT Session Filter Settings"
+g_smt_assets = "SMT Asset Pair Resolver Settings"
+
+const string TIP_DYNAMIC_SMT_LABELS = "When enabled, hides SMT labels on the exact chart timeframe used as that SMT family's maximum calculation gate. 3M and 12M labels are excluded."
+const string TIP_DISPLAY_CAP = "Maximum retained SMTs per timeframe, pair, and direction bucket."
+const string TIP_NEARBY_ONLY = "Shows only SMTs whose endpoint is within the latest chart bars."
+const string TIP_CLEANUP = "Controls conflict handling. All removes lower-priority conflicts; Bypass modes keep conflicts but fade the bypassed SMT; None disables cleanup."
+const string TIP_AESTHETIC_BYPASS = "In Bypass cleanup modes, keeps conflicting SMTs visible with lower contrast instead of fully removing them."
+const string TIP_BYPASS_LABELS = "Shows labels on faded bypassed SMTs. Turn off for cleaner charts."
+const string TIP_SESSION_FILTER = "Filters SMTs using Sessions time windows"
+const string TIP_AUTO_SESSION = "Automatically selects one session from the latest chart candle time. Timing fields are locked while Auto is on, but their stored values are still used."
+const string TIP_MANUAL_PAIRS = "Manual Pairs inputs are for correlated assets. Current Asset is fetched from current chart asset."
+
+smt_txt_all = input.color(#4a4a4a, "SMT Text", inline="smt_txt", group=g_smt)
+smt_label_style = input.string("TF + Asset", "SMT Label Style", options=["TF + Asset", "Asset Only", "TF Only"], group=g_smt)
+smt_label_size = input.string(size.tiny, "SMT Labels Size", options=[size.tiny, size.small, size.normal, size.large, size.huge], group=g_smt)
+smt_labels_show = input.bool(true, "SMT Labels?", group=g_smt)
+smt_dynamic_labels = input.bool(true, "Dynamic SMT Labels?", group=g_smt, tooltip=TIP_DYNAMIC_SMT_LABELS)
+
+smt_render_nearby_only = input.bool(false, "Render Gate?  ", group=g_smt_gates, tooltip=TIP_NEARBY_ONLY, inline='renderbars')
+smt_nearby_bars = input.int(400, " ", minval=1, maxval=5000, group=g_smt_gates, active=smt_render_nearby_only, inline='renderbars')
+smt_history_limit = input.int(20, "Display Cap", minval=1, maxval=100, group=g_smt_gates)
+smt_monthly_min_tf = input.string("1 Hour", "Monthly SMTs TF ≥.", options=["None", "1 Hour", "4 Hour", "1 Day"], group=g_smt_gates)
+smt_only_current_tf = input.bool(false, "Only Show/Arm SSMT at Current Chart TF", group=g_smt_gates, tooltip="When on, ranks coarser than your current chart timeframe are neither rendered nor allowed to arm tCISD — cuts down label clutter from higher-TF SMT events and stops tCISD confirming off a rank you can't see.")
+
+smt_15m_show = input.bool(false, "15m", inline="smt_r1", group=g_smt_ranks)
+smt_15m_clr = input.color(#dbdbdb, "", inline="smt_r1", group=g_smt_ranks)
+smt_30m_show = input.bool(false, "30m", inline="smt_r1", group=g_smt_ranks)
+smt_30m_clr = input.color(#dbdbdb, "", inline="smt_r1", group=g_smt_ranks)
+smt_1h_show = input.bool(true, "1H ", inline="smt_r1", group=g_smt_ranks)
+smt_1h_clr = input.color(#dbdbdb, "", inline="smt_r1", group=g_smt_ranks)
+smt_90m_show = input.bool(true, "90m", inline="smt_r1", group=g_smt_ranks)
+smt_90m_clr = input.color(#dbdbdb, "", inline="smt_r1", group=g_smt_ranks)
+smt_4h_show = input.bool(true, "4H ", inline="smt_r2", group=g_smt_ranks)
+smt_4h_clr = input.color(#dbdbdb, "", inline="smt_r2", group=g_smt_ranks)
+smt_6h_show = input.bool(false, "6H ", inline="smt_r2", group=g_smt_ranks)
+smt_6h_clr = input.color(#dbdbdb, "", inline="smt_r2", group=g_smt_ranks)
+smt_7h_show = input.bool(true, "7H ", inline="smt_r2", group=g_smt_ranks)
+smt_7h_clr = input.color(#dbdbdb, "", inline="smt_r2", group=g_smt_ranks)
+smt_12h_show = input.bool(true, "12H", inline="smt_r2", group=g_smt_ranks)
+smt_12h_clr = input.color(#dbdbdb, "", inline="smt_r2", group=g_smt_ranks)
+smt_1d_show = input.bool(true, "1D ", inline="smt_r3", group=g_smt_ranks)
+smt_1d_clr = input.color(#b8b8b8, "", inline="smt_r3", group=g_smt_ranks)
+smt_1w_show = input.bool(true, "1W ", inline="smt_r3", group=g_smt_ranks)
+smt_1w_clr = input.color(#b8b8b8, "", inline="smt_r3", group=g_smt_ranks)
+smt_1m_show = input.bool(false, "1M ", inline="smt_r3", group=g_smt_ranks)
+smt_1m_clr = input.color(#9c9c9c, "", inline="smt_r3", group=g_smt_ranks)
+smt_3m_show = input.bool(false, "3M ", inline="smt_r3", group=g_smt_ranks)
+smt_3m_clr = input.color(#636363, "", inline="smt_r3", group=g_smt_ranks)
+smt_12m_show = input.bool(false, "12M", inline="smt_r4", group=g_smt_ranks)
+smt_12m_clr = input.color(#2e2e2e, "", inline="smt_r4", group=g_smt_ranks)
+
+smt_line_style_input = input.string("___", "SMT Line Style", options=["___", "----", "...."], group=g_smt_ranks)
+smt_line_style = smt_line_style_input == "----" ? line.style_dashed : smt_line_style_input == "...." ? line.style_dotted : line.style_solid
+smt_cleanup_mode = input.string("All", "SMT Cleanup", options=["All", "Bypass Pivot A", "Bypass Pivot B", "Bypass Inside Range", "None"], group=g_smt_ranks, tooltip=TIP_CLEANUP)
+smt_aesthetic_bypass = input.bool(true, "Aesthetic Bypass?", inline="smt_bypass", group=g_smt_ranks, active=smt_cleanup_mode == "Bypass Pivot A" or smt_cleanup_mode == "Bypass Pivot B" or smt_cleanup_mode == "Bypass Inside Range", tooltip=TIP_AESTHETIC_BYPASS)
+smt_bypass_labels_show = input.bool(false, "Bypass Labels?", inline="smt_bypass", group=g_smt_ranks, active=smt_aesthetic_bypass and (smt_cleanup_mode == "Bypass Pivot A" or smt_cleanup_mode == "Bypass Pivot B" or smt_cleanup_mode == "Bypass Inside Range"), tooltip=TIP_BYPASS_LABELS)
+smt_cleanup_pivot_a = smt_cleanup_mode != "Bypass Pivot A" and smt_cleanup_mode != "None"
+smt_cleanup_pivot_b = smt_cleanup_mode != "Bypass Pivot B" and smt_cleanup_mode != "None"
+smt_cleanup_inside = smt_cleanup_mode != "Bypass Inside Range" and smt_cleanup_mode != "None"
+
+smt_session_filter_on = input.bool(false, "Enable SMT Session Filter?", inline="smt_sess_master", group=g_smt_sessions, tooltip=TIP_SESSION_FILTER)
+smt_auto_session_filter = input.bool(false, "Auto", inline="smt_sess_master", group=g_smt_sessions, active=smt_session_filter_on, tooltip=TIP_AUTO_SESSION)
+smt_session_1_on = input.bool(false, "Asia   ", inline="smt_sess1", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter)
+smt_session_1_start = input.string("20:00", "", options=["20:00", "20:30", "21:00", "21:30"], inline="smt_sess1", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter and smt_session_1_on)
+smt_session_1_end = input.string("00:00", "—", options=["00:00", "00:30", "01:00", "01:30"], inline="smt_sess1", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter and smt_session_1_on)
+smt_session_2_on = input.bool(false, "London", inline="smt_sess2", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter)
+smt_session_2_start = input.string("02:00", "", options=["01:30", "02:00", "02:30", "03:00"], inline="smt_sess2", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter and smt_session_2_on)
+smt_session_2_end = input.string("06:00", "—", options=["05:00", "05:30", "06:00", "06:30"], inline="smt_sess2", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter and smt_session_2_on)
+smt_session_3_on = input.bool(true, "NY-AM ", inline="smt_sess3", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter)
+smt_session_3_start = input.string("07:30", "", options=["07:30", "08:00", "08:30", "09:00"], inline="smt_sess3", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter and smt_session_3_on)
+smt_session_3_end = input.string("12:00", "—", options=["12:00", "12:30", "13:00", "13:30"], inline="smt_sess3", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter and smt_session_3_on)
+smt_session_4_on = input.bool(false, "NY-PM ", inline="smt_sess4", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter)
+smt_session_4_start = input.string("13:30", "", options=["13:00", "13:30", "14:00", "14:30"], inline="smt_sess4", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter and smt_session_4_on)
+smt_session_4_end = input.string("17:00", "—", options=["17:00", "17:30", "18:00", "18:30"], inline="smt_sess4", group=g_smt_sessions, active=smt_session_filter_on and not smt_auto_session_filter and smt_session_4_on)
+smt_render_current_day_only = input.bool(false, "Render Only Current Day Range                                            ", group=g_smt_sessions)
+
+smt_pair_selection = input.string("Auto", "Pair Selection", options=["Auto", "Manual"], group=g_smt_assets, tooltip=TIP_MANUAL_PAIRS)
+smt_correlation_mode = input.string("Classic", "Correlation Mode", options=["GXT", "Classic"], group=g_smt_assets)
+smt_correlation_type = input.string("Triad", "Correlation Type", options=["Dyad", "Triad", "Tetrad"], group=g_smt_assets)
+smt_manual_pair1 = input.symbol("", "Pair 1", inline="smt_manual_pair1", group=g_smt_assets, active=smt_pair_selection == "Manual")
+smt_manual_pair1_inverted = input.bool(false, "Inversed?", inline="smt_manual_pair1", group=g_smt_assets, active=smt_pair_selection == "Manual")
+smt_manual_pair2 = input.symbol("", "Pair 2", inline="smt_manual_pair2", group=g_smt_assets, active=smt_pair_selection == "Manual" and smt_correlation_type != "Dyad")
+smt_manual_pair2_inverted = input.bool(false, "Inversed?", inline="smt_manual_pair2", group=g_smt_assets, active=smt_pair_selection == "Manual" and smt_correlation_type != "Dyad")
+smt_manual_pair3 = input.symbol("", "Pair 3", inline="smt_manual_pair3", group=g_smt_assets, active=smt_pair_selection == "Manual" and smt_correlation_type == "Tetrad")
+smt_manual_pair3_inverted = input.bool(false, "Inversed?", inline="smt_manual_pair3", group=g_smt_assets, active=smt_pair_selection == "Manual" and smt_correlation_type == "Tetrad")
+
+// -----------------------------------------------------------------------------
+// Time declarations and GXV auto timezone/session helpers
+// -----------------------------------------------------------------------------
+tf = timeframe.period
+tf_sec = timeframe.in_seconds(tf)
+f_is_mid_prefix(string px) =>
+    px == "CAPITALCOM" or px == "CMCMARKETS"
+
+f_is_chicago_prefix(string px) =>
+    px == "CME" or px == "CBOT" or px == "CBOT_MINI" or px == "CBOT_DL" or px == "CME_MINI" or px == "CME_DL" or px == "CME_MINI_DL" or px == "COMEX" or px == "NYMEX"
+
+f_is_utc_prefix(string px) =>
+    px == "BINANCE" or px == "BYBIT" or px == "KRAKEN" or px == "GATE.IO" or px == "BITSTAMP" or px == "COINBASE" or px == "GEMINI"
+
+f_oracle_tz(string px) =>
+    f_is_chicago_prefix(px) ? "America/Chicago" : f_is_mid_prefix(px) ? "Etc/GMT+5" : f_is_utc_prefix(px) ? "UTC" : "America/New_York"
+
+f_oracle_day_start_hour(string px) =>
+    f_is_chicago_prefix(px) or f_is_mid_prefix(px) ? 17 : f_is_utc_prefix(px) ? 22 : 18
+
+f_days_since_sunday(int dow) =>
+    dow == dayofweek.sunday ? 0 : dow == dayofweek.monday ? 1 : dow == dayofweek.tuesday ? 2 : dow == dayofweek.wednesday ? 3 : dow == dayofweek.thursday ? 4 : dow == dayofweek.friday ? 5 : 6
+
+f_smt_anchor_range_key(int barTime, int anchorTime, int rangeMinutes) =>
+    int rangeMs = rangeMinutes * 60 * 1000
+    int bucket = int(math.floor((barTime - anchorTime) / rangeMs))
+    anchorTime + bucket * rangeMs
+
+f_smt_daily_range_key(int dayStartTime) =>
+    dayStartTime
+
+f_smt_iso_week_year(int refTime, string tz) =>
+    int wy = year(refTime, tz)
+    int wm = month(refTime, tz)
+    int cw = weekofyear(refTime, tz)
+    if wm == 12 and cw == 1
+        wy := wy + 1
+    else if wm == 1 and cw >= 52
+        wy := wy - 1
+    wy
+
+f_smt_iso_week_range_key(int dayStartTime, int oneDayMs, string tz) =>
+    int refTime = dayStartTime + oneDayMs
+    int wy = f_smt_iso_week_year(refTime, tz)
+    int cw = weekofyear(refTime, tz)
+    wy * 100 + cw
+
+f_smt_month_range_key(int dayStartTime, string tz) =>
+    year(dayStartTime, tz) * 100 + month(dayStartTime, tz)
+
+f_smt_month_of_quarter_slot(int dayStartTime, string tz) =>
+    int cm = month(dayStartTime, tz)
+    int qsM = int(math.floor((cm - 1) / 3)) * 3 + 1
+    cm - qsM
+
+f_smt_month_of_quarter_range_key(int dayStartTime, string tz) =>
+    int cy = year(dayStartTime, tz)
+    int cm = month(dayStartTime, tz)
+    int q = int(math.floor((cm - 1) / 3)) + 1
+    int slot = f_smt_month_of_quarter_slot(dayStartTime, tz)
+    cy * 100 + q * 10 + slot
+
+f_smt_quarter_subrange_slot(int barTime, int dayStartTime, string tz, int startHour) =>
+    int cy = year(dayStartTime, tz)
+    int cm = month(dayStartTime, tz)
+    int qsM = int(math.floor((cm - 1) / 3)) * 3 + 1
+    int qsT = timestamp(tz, cy, qsM, 1, startHour, 0)
+    int qeT = qsM == 10 ? timestamp(tz, cy + 1, 1, 1, startHour, 0) : timestamp(tz, cy, qsM + 3, 1, startHour, 0)
+    int q = int(math.floor((barTime - qsT) * 4.0 / math.max(1, qeT - qsT)))
+    math.max(0, math.min(3, q))
+
+f_smt_quarter_subrange_key(int barTime, int dayStartTime, string tz, int startHour) =>
+    int cy = year(dayStartTime, tz)
+    int cm = month(dayStartTime, tz)
+    int quarter = int(math.floor((cm - 1) / 3)) + 1
+    int slot = f_smt_quarter_subrange_slot(barTime, dayStartTime, tz, startHour)
+    cy * 100 + quarter * 10 + slot
+
+f_smt_four_year_phase(int y) =>
+    y % 4 == 3 ? 0 : y % 4 == 0 ? 1 : y % 4 == 1 ? 2 : 3
+
+f_smt_four_year_range_key(int barTime, string tz) =>
+    int y = year(barTime, tz)
+    int block = int(math.floor(y / 4))
+    block * 10 + f_smt_four_year_phase(y)
+
+f_smt_local_day_start(int barTime, string tz, int startHour) =>
+    int localYear = year(barTime, tz)
+    int localMonth = month(barTime, tz)
+    int localDay = dayofmonth(barTime, tz)
+    int todayStart = timestamp(tz, localYear, localMonth, localDay, startHour, 0)
+    int previousDayProbe = barTime - 24 * 60 * 60 * 1000
+    barTime >= todayStart ? todayStart : timestamp(tz, year(previousDayProbe, tz), month(previousDayProbe, tz), dayofmonth(previousDayProbe, tz), startHour, 0)
+
+f_smt_shift_local_day_start(int sourceDayStart, int daysBack, string tz, int startHour) =>
+    int shiftedProbe = sourceDayStart - daysBack * 24 * 60 * 60 * 1000
+    timestamp(tz, year(shiftedProbe, tz), month(shiftedProbe, tz), dayofmonth(shiftedProbe, tz), startHour, 0)
+
+px = syminfo.prefix
+oracle_tz = f_oracle_tz(px)
+dayStartHour = f_oracle_day_start_hour(px)
+msDay = 24 * 60 * 60 * 1000
+dayStart = f_smt_local_day_start(time, oracle_tz, dayStartHour)
+dayStartDow = dayofweek(dayStart, oracle_tz)
+weeklyCycleAnchor = f_smt_shift_local_day_start(dayStart, f_days_since_sunday(dayStartDow), oracle_tz, dayStartHour)
+
+// GXV deterministic range keys.
+val_ses15 = f_smt_anchor_range_key(time, dayStart, 15)
+val_ses30 = f_smt_anchor_range_key(time, dayStart, 30)
+val_ses90 = f_smt_anchor_range_key(time, dayStart, 90)
+val_ses60 = f_smt_anchor_range_key(time, dayStart, 60)
+val_ses240 = f_smt_anchor_range_key(time, dayStart, 240)
+val_sesD = f_smt_anchor_range_key(time, dayStart, 360)
+val_ses420 = f_smt_anchor_range_key(time, weeklyCycleAnchor, 420)
+val_ses720 = f_smt_anchor_range_key(time, dayStart, 720)
+val_sesW = f_smt_daily_range_key(dayStart)
+val_sesM = f_smt_iso_week_range_key(dayStart, msDay, oracle_tz)
+val_sesMT = f_smt_month_of_quarter_range_key(dayStart, oracle_tz)
+val_sesQ = f_smt_quarter_subrange_key(time, dayStart, oracle_tz, dayStartHour)
+val_sesY = f_smt_four_year_range_key(time, "America/New_York")
+
+// GXV chart-timeframe gates — hardcoded stable reconstruction-safe gates.
+const int TF_SEC_1 = 60
+const int TF_SEC_3 = 3 * TF_SEC_1
+const int TF_SEC_5 = 5 * TF_SEC_1
+const int TF_SEC_15 = 15 * TF_SEC_1
+const int TF_SEC_30 = 30 * TF_SEC_1
+const int TF_SEC_60 = 60 * TF_SEC_1
+const int TF_SEC_240 = 240 * TF_SEC_1
+const int TF_SEC_360 = 360 * TF_SEC_1
+const int TF_SEC_D = 24 * 60 * 60
+const int TF_SEC_M = 30 * TF_SEC_D
+
+SMT_GATE_15M = TF_SEC_5
+SMT_GATE_30M = TF_SEC_5
+SMT_GATE_90M = TF_SEC_15
+SMT_GATE_1H = TF_SEC_15
+SMT_GATE_4H = TF_SEC_60
+SMT_GATE_6H = TF_SEC_60
+SMT_GATE_7H = TF_SEC_60
+SMT_GATE_12H = TF_SEC_240
+SMT_GATE_1D = TF_SEC_240
+SMT_GATE_1W = TF_SEC_360
+SMT_GATE_1M = TF_SEC_360
+SMT_GATE_3M = TF_SEC_D
+SMT_GATE_12M = TF_SEC_M
+tf_ok_15m = tf_sec <= SMT_GATE_15M
+tf_ok_30m = tf_sec <= SMT_GATE_30M
+tf_ok_90m = tf_sec <= SMT_GATE_90M
+tf_ok_1h = tf_sec <= SMT_GATE_1H
+tf_ok_4h = tf_sec <= SMT_GATE_4H
+tf_ok_6h = tf_sec <= SMT_GATE_6H
+tf_ok_7h = tf_sec <= SMT_GATE_7H
+tf_ok_12h = tf_sec <= SMT_GATE_12H
+tf_ok_1d = tf_sec <= SMT_GATE_1D
+tf_ok_1w = tf_sec <= SMT_GATE_1W
+tf_ok_1m = tf_sec <= SMT_GATE_1M
+tf_ok_3m = tf_sec <= SMT_GATE_3M
+tf_ok_12m = tf_sec <= SMT_GATE_12M
+
+// Monthly SMT minimum chart-timeframe render policy.
+f_smt_monthly_tf_render_ok(int rank) =>
+    bool isMonthlyRank = rank == 11 or rank == 12 or rank == 13
+    int minTfSec = smt_monthly_min_tf == "1 Hour" ? TF_SEC_60 : smt_monthly_min_tf == "4 Hour" ? TF_SEC_240 : smt_monthly_min_tf == "1 Day" ? TF_SEC_D : 0
+    not isMonthlyRank or minTfSec == 0 or tf_sec >= minTfSec
+
+// -----------------------------------------------------------------------------
+// GXV AssetCorrelationUtils bridge — real auto pair mapping via the imported
+// library (Dyad/Triad/Tetrad, GXT/Classic correlation modes)
+// -----------------------------------------------------------------------------
+type SmtCorrelationDescriptor
+    string symbol
+    string displayName
+    bool inverse
+    bool configured
+    bool dataReady
+    float sourceHigh
+    float sourceLow
+    int sourceTime
+
+const string INVALID_SECONDARY = "__GXV_SMT_INVALID_SECONDARY__"
+const string INVALID_TERTIARY = "__GXV_SMT_INVALID_TERTIARY__"
+const string INVALID_QUATERNARY = "__GXV_SMT_INVALID_QUATERNARY__"
+
+f_has_symbol(string s) =>
+    str.length(s) > 0
+
+f_asset_token(string s) =>
+    array<string> parts = str.split(s, ":")
+    array.size(parts) > 1 ? array.get(parts, 1) : s
+
+f_same_symbol(string a, string b) =>
+    str.upper(a) == str.upper(b) or str.upper(f_asset_token(a)) == str.upper(f_asset_token(b))
+
+string csym = ""
+string tsym3 = ""
+string qsym4 = ""
+bool corr_base_ok = false
+bool corr_has_tertiary = false
+bool corr_has_quaternary = false
+bool corr_pair1_ok = false
+bool corr_pair2_ok = false
+bool corr_pair3_ok = false
+bool corr_pair1_configured = false
+bool corr_pair2_configured = false
+bool corr_pair3_configured = false
+bool corr_inv1 = false
+bool corr_inv2 = false
+bool corr_inv3 = false
+bool corr_type_pair2 = smt_correlation_type != "Dyad"
+bool corr_type_pair3 = smt_correlation_type == "Tetrad"
+bool corr_manual_mode = smt_pair_selection == "Manual"
+bool corr_manual_pair1_ok = f_has_symbol(smt_manual_pair1) and not f_same_symbol(smt_manual_pair1, syminfo.tickerid)
+bool corr_manual_pair2_ok = corr_type_pair2 and f_has_symbol(smt_manual_pair2) and not f_same_symbol(smt_manual_pair2, syminfo.tickerid) and not f_same_symbol(smt_manual_pair2, smt_manual_pair1)
+bool corr_manual_pair3_ok = corr_type_pair3 and f_has_symbol(smt_manual_pair3) and not f_same_symbol(smt_manual_pair3, syminfo.tickerid) and not f_same_symbol(smt_manual_pair3, smt_manual_pair1) and not f_same_symbol(smt_manual_pair3, smt_manual_pair2)
+if corr_manual_mode
+    corr_base_ok := corr_manual_pair1_ok
+    corr_has_tertiary := corr_manual_pair2_ok
+    corr_has_quaternary := corr_manual_pair3_ok
+    csym := corr_manual_pair1_ok ? smt_manual_pair1 : ""
+    tsym3 := corr_manual_pair2_ok ? smt_manual_pair2 : ""
+    qsym4 := corr_manual_pair3_ok ? smt_manual_pair3 : ""
+    corr_inv1 := corr_manual_pair1_ok ? smt_manual_pair1_inverted : false
+    corr_inv2 := corr_manual_pair2_ok ? smt_manual_pair2_inverted : false
+    corr_inv3 := corr_manual_pair3_ok ? smt_manual_pair3_inverted : false
+else
+    GXV.AssetConfig corr_cfg = GXV.resolveAssetsByCorrelation(syminfo.ticker, syminfo.tickerid, syminfo.type, syminfo.session, false, smt_correlation_mode, smt_correlation_type)
+    corr_base_ok := corr_cfg.detected and f_has_symbol(corr_cfg.secondary) and not f_same_symbol(corr_cfg.secondary, syminfo.tickerid)
+    corr_has_tertiary := corr_type_pair2 and corr_base_ok and f_has_symbol(corr_cfg.tertiary) and not f_same_symbol(corr_cfg.tertiary, syminfo.tickerid) and not f_same_symbol(corr_cfg.secondary, corr_cfg.tertiary)
+    corr_has_quaternary := corr_type_pair3 and corr_has_tertiary and f_has_symbol(corr_cfg.quaternary) and not f_same_symbol(corr_cfg.quaternary, syminfo.tickerid) and not f_same_symbol(corr_cfg.quaternary, corr_cfg.secondary) and not f_same_symbol(corr_cfg.quaternary, corr_cfg.tertiary)
+    csym := corr_base_ok ? corr_cfg.secondary : ""
+    tsym3 := corr_has_tertiary ? corr_cfg.tertiary : ""
+    qsym4 := corr_has_quaternary ? corr_cfg.quaternary : ""
+    corr_inv1 := corr_base_ok ? corr_cfg.invertSecondary : false
+    corr_inv2 := corr_has_tertiary ? corr_cfg.invertTertiary : false
+    corr_inv3 := corr_has_quaternary ? corr_cfg.invertQuaternary : false
+corr_pair1_configured := corr_base_ok and f_has_symbol(csym)
+corr_pair2_configured := corr_has_tertiary and f_has_symbol(tsym3)
+corr_pair3_configured := corr_has_quaternary and f_has_symbol(qsym4)
+string corr_fetch_sym1 = corr_pair1_configured ? csym : INVALID_SECONDARY
+string corr_fetch_sym2 = corr_pair2_configured ? tsym3 : INVALID_TERTIARY
+string corr_fetch_sym3 = corr_pair3_configured ? qsym4 : INVALID_QUATERNARY
+[xh0, xl0, xt0] = request.security(corr_fetch_sym1, tf, [high, low, time], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[yh0, yl0, yt0] = request.security(corr_fetch_sym2, tf, [high, low, time], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[zh0, zl0, zt0] = request.security(corr_fetch_sym3, tf, [high, low, time], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+corr_pair1_ok := corr_pair1_configured and not na(xh0) and not na(xl0) and not na(xt0)
+corr_pair2_ok := corr_pair2_configured and not na(yh0) and not na(yl0) and not na(yt0)
+corr_pair3_ok := corr_pair3_configured and not na(zh0) and not na(zl0) and not na(zt0)
+string smt_pair = corr_pair1_configured ? GXV.getAssetTicker(csym) : ""
+string smt_pair2 = corr_pair2_configured ? GXV.getAssetTicker(tsym3) : ""
+string smt_pair3 = corr_pair3_configured ? GXV.getAssetTicker(qsym4) : ""
+SmtCorrelationDescriptor smt_corr_pair1 = SmtCorrelationDescriptor.new(csym, smt_pair, corr_inv1, corr_pair1_configured, corr_pair1_ok, xh0, xl0, xt0)
+SmtCorrelationDescriptor smt_corr_pair2 = SmtCorrelationDescriptor.new(tsym3, smt_pair2, corr_inv2, corr_pair2_configured, corr_pair2_ok, yh0, yl0, yt0)
+SmtCorrelationDescriptor smt_corr_pair3 = SmtCorrelationDescriptor.new(qsym4, smt_pair3, corr_inv3, corr_pair3_configured, corr_pair3_ok, zh0, zl0, zt0)
+
+// -----------------------------------------------------------------------------
+// GXV SMT market-state engine
+// DATA -> RANGE -> SWEEP -> DIVERGENCE -> EVENT -> INVALIDATION -> PROJECTION
+// -----------------------------------------------------------------------------
+const int SMT_STATE_CYCLES = 13
+const int SMT_SRC_COUNT = 4
+const int SMT_PAIR_COUNT = 3
+const int SMT_SRC_MAIN = 0
+const int SMT_SRC_PAIR1 = 1
+const int SMT_SRC_PAIR2 = 2
+const int SMT_SRC_PAIR3 = 3
+const int SMT_DIR_BEAR = -1
+const int SMT_DIR_BULL = 1
+const int SMT_EVENT_LIVE = 1
+const int SMT_EVENT_CONFIRMED = 2
+const int SMT_EVENT_INVALIDATED = 3
+const int SMT_LIVE_SLOTS = SMT_STATE_CYCLES * SMT_PAIR_COUNT * 2
+const int SMT_DOMAIN_EVENT_CAP = 600
+const int SMT_RENDER_EVENT_CAP = 480
+
+type SmtRangeState
+    float currentHigh
+    float previousHigh
+    float currentLow
+    float previousLow
+    int currentHighTime
+    int previousHighTime
+    int currentLowTime
+    int previousLowTime
+    int currentHighBar
+    int previousHighBar
+    int currentLowBar
+    int previousLowBar
+    int cycleKey
+    int previousCycleKey
+    bool hasCurrentRange
+    bool hasPreviousRange
+
+type SmtSweepState
+    bool ready
+    bool highSwept
+    bool lowSwept
+    float highPivotA
+    float highPivotB
+    float lowPivotA
+    float lowPivotB
+    int highTimeA
+    int highTimeB
+    int lowTimeA
+    int lowTimeB
+    int highBarA
+    int highBarB
+    int lowBarA
+    int lowBarB
+
+type SmtEvent
+    int id
+    int rank
+    int pairSlot
+    int dir
+    int cycleKey
+    int previousCycleKey
+    float pivotAPrice
+    float pivotBPrice
+    int pivotATime
+    int pivotBTime
+    int pivotABar
+    int pivotBBar
+    int structType
+    int state
+    bool bodyBlocked
+    line lineId
+    label labelId
+    bool projectA
+    bool projectB
+    bool bypassed
+
+type SmtLiveSlot
+    bool active
+    int eventId
+    int cycleKey
+
+var array<SmtRangeState> smt_range_states = array.new<SmtRangeState>()
+var array<SmtEvent> smt_events = array.new<SmtEvent>()
+var array<SmtLiveSlot> smt_live_slots = array.new<SmtLiveSlot>()
+
+f_smt_state_idx(int cycleIdx, int srcIdx) =>
+    cycleIdx * SMT_SRC_COUNT + srcIdx
+
+f_smt_live_slot(int rank, int pairSlot, int dir) =>
+    (rank - 1) * SMT_PAIR_COUNT * 2 + (pairSlot - 1) * 2 + (dir == SMT_DIR_BULL ? 1 : 0)
+
+f_smt_event_id(int rank, int pairSlot, int dir, int cycleKey) =>
+    cycleKey * 100 + f_smt_live_slot(rank, pairSlot, dir)
+
+f_smt_seed_engine() =>
+    if array.size(smt_range_states) == 0
+        for i = 0 to SMT_STATE_CYCLES * SMT_SRC_COUNT - 1
+            array.push(smt_range_states, SmtRangeState.new(na, na, na, na, na, na, na, na, na, na, na, na, na, na, false, false))
+    if array.size(smt_live_slots) == 0
+        for i = 0 to SMT_LIVE_SLOTS - 1
+            array.push(smt_live_slots, SmtLiveSlot.new(false, na, na))
+    0
+
+// Each rank's own literal timeframe length (NOT the reconstruction gate
+// above, which is a stricter "how fine must the chart be to compute this
+// rank at all" requirement) — used only to compare against the chart's own
+// resolution for the current-TF-only toggle below.
+f_smt_rank_duration_sec(int rank) =>
+    rank == 1 ? 900 : rank == 2 ? 1800 : rank == 3 ? 3600 : rank == 4 ? 5400 : rank == 5 ? 14400 : rank == 6 ? 21600 : rank == 7 ? 25200 : rank == 8 ? 43200 : rank == 9 ? 86400 : rank == 10 ? 604800 : rank == 11 ? 2592000 : rank == 12 ? 7776000 : 31536000
+
+f_smt_rank_enabled(int rank) =>
+    bool shown = rank == 1 ? smt_15m_show : rank == 2 ? smt_30m_show : rank == 3 ? smt_1h_show : rank == 4 ? smt_90m_show : rank == 5 ? smt_4h_show : rank == 6 ? smt_6h_show : rank == 7 ? smt_7h_show : rank == 8 ? smt_12h_show : rank == 9 ? smt_1d_show : rank == 10 ? smt_1w_show : rank == 11 ? smt_1m_show : rank == 12 ? smt_3m_show : rank == 13 ? smt_12m_show : false
+    bool tfOk = not smt_only_current_tf or f_smt_rank_duration_sec(rank) <= tf_sec
+    shown and tfOk
+
+f_smt_pair_enabled(int pairSlot) =>
+    pairSlot == 1 ? smt_corr_pair1.configured : pairSlot == 2 ? smt_corr_pair2.configured : pairSlot == 3 ? smt_corr_pair3.configured : false
+
+f_smt_rank_shortname(int rank) =>
+    rank == 1 ? "15m" : rank == 2 ? "30m" : rank == 3 ? "1H" : rank == 4 ? "90m" : rank == 5 ? "4H" : rank == 6 ? "6H" : rank == 7 ? "7H" : rank == 8 ? "12H" : rank == 9 ? "1D" : rank == 10 ? "1W" : rank == 11 ? "1M" : rank == 12 ? "3M" : rank == 13 ? "12M" : ""
+
+f_smt_rank_color(int rank) =>
+    rank == 1 ? smt_15m_clr : rank == 2 ? smt_30m_clr : rank == 3 ? smt_1h_clr : rank == 4 ? smt_90m_clr : rank == 5 ? smt_4h_clr : rank == 6 ? smt_6h_clr : rank == 7 ? smt_7h_clr : rank == 8 ? smt_12h_clr : rank == 9 ? smt_1d_clr : rank == 10 ? smt_1w_clr : rank == 11 ? smt_1m_clr : rank == 12 ? smt_3m_clr : rank == 13 ? smt_12m_clr : color.gray
+
+f_smt_rank_gate_sec(int rank) =>
+    rank == 1 ? SMT_GATE_15M : rank == 2 ? SMT_GATE_30M : rank == 3 ? SMT_GATE_1H : rank == 4 ? SMT_GATE_90M : rank == 5 ? SMT_GATE_4H : rank == 6 ? SMT_GATE_6H : rank == 7 ? SMT_GATE_7H : rank == 8 ? SMT_GATE_12H : rank == 9 ? SMT_GATE_1D : rank == 10 ? SMT_GATE_1W : rank == 11 ? SMT_GATE_1M : rank == 12 ? SMT_GATE_3M : SMT_GATE_12M
+
+f_smt_pair_name_for_slot(int pairSlot) =>
+    pairSlot == 1 ? smt_corr_pair1.displayName : pairSlot == 2 ? smt_corr_pair2.displayName : pairSlot == 3 ? smt_corr_pair3.displayName : ""
+
+f_smt_label_text(string shortname, string pairName) =>
+    smt_label_style == "Asset Only" ? "SMT " + pairName : smt_label_style == "TF Only" ? shortname + " SMT" : shortname + " SMT " + pairName
+
+f_smt_default_label_text(int rank, int pairSlot) =>
+    f_smt_label_text(f_smt_rank_shortname(rank), f_smt_pair_name_for_slot(pairSlot))
+
+f_smt_bypass_label_text(int rank, int pairSlot) =>
+    smt_label_style == "Asset Only" ? f_smt_pair_name_for_slot(pairSlot) : f_smt_rank_shortname(rank)
+
+f_smt_labels_for_rank(int rank) =>
+    bool dynamicExcluded = rank == 12 or rank == 13
+    bool hideAtOrAboveGate = smt_dynamic_labels and not dynamicExcluded and tf_sec >= f_smt_rank_gate_sec(rank)
+    smt_labels_show and not hideAtOrAboveGate
+
+f_smt_event_mid_y(float y1, float y2) =>
+    math.round_to_mintick((y1 + y2) * 0.5)
+
+f_smt_event_label_time(int x1, int x2, int b1, int b2) =>
+    int labelBar = int(math.floor((b1 + b2) * 0.5))
+    int labelOffset = bar_index - labelBar
+    bool canUseMidBarTime = not na(labelBar) and labelOffset >= 0 and labelOffset <= 5000
+    canUseMidBarTime ? time[labelOffset] : int(math.round(x1 + (x2 - x1) * 0.5))
+
+f_smt_structure_type(bool isBull, float y1, float y2) =>
+    isBull ? (y2 > y1 ? 1 : y2 < y1 ? 2 : 0) : (y2 > y1 ? 3 : y2 < y1 ? 4 : 0)
+
+f_smt_struct_required_for_cleanup(int rank) =>
+    rank == 11 or rank == 12 or rank == 13
+
+f_smt_cleanup_struct_ok(int dominatedRank, int dominatedStruct, int dominantStruct) =>
+    not f_smt_struct_required_for_cleanup(dominatedRank) or (dominatedStruct != 0 and dominatedStruct == dominantStruct)
+
+f_smt_body_filter_applies(int rank) =>
+    rank != 13
+
+f_smt_body_intersects(int bx1, int bx2, float y1, float y2) =>
+    bool hit = false
+    int span = bx2 - bx1
+    if span > 3
+        int fromX = math.max(bx1 + 2, bar_index - 4999)
+        int toX = math.min(bx2 - 2, bar_index)
+        if fromX <= toX
+            for x = fromX to toX
+                int barsAgo = bar_index - x
+                float linePrice = y1 + (y2 - y1) * (x - bx1) / span
+                float bodyLow = math.min(open[barsAgo], close[barsAgo])
+                float bodyHigh = math.max(open[barsAgo], close[barsAgo])
+                if bodyLow <= linePrice and linePrice <= bodyHigh
+                    hit := true
+                    break
+    hit
+
+// Equality is not a liquidity take; strict extrema retain first-touch identity.
+f_smt_high_swept(float currentValue, float previousValue) =>
+    not na(currentValue) and not na(previousValue) and currentValue > previousValue
+
+f_smt_low_swept(float currentValue, float previousValue) =>
+    not na(currentValue) and not na(previousValue) and currentValue < previousValue
+
+f_smt_update_state(int cycleIdx, int srcIdx, bool engineEnabled, int rangeKey, float srcHigh, float srcLow, int srcTime) =>
+    if engineEnabled and not na(rangeKey)
+        int idx = f_smt_state_idx(cycleIdx, srcIdx)
+        SmtRangeState st = array.get(smt_range_states, idx)
+        bool dataReady = not na(srcHigh) and not na(srcLow) and not na(srcTime)
+        if na(st.cycleKey)
+            st.cycleKey := rangeKey
+            st.previousCycleKey := na
+            st.hasCurrentRange := false
+            st.hasPreviousRange := false
+        else if rangeKey != st.cycleKey
+            st.previousHigh := st.currentHigh
+            st.previousLow := st.currentLow
+            st.previousHighTime := st.currentHighTime
+            st.previousLowTime := st.currentLowTime
+            st.previousHighBar := st.currentHighBar
+            st.previousLowBar := st.currentLowBar
+            st.previousCycleKey := st.cycleKey
+            st.hasPreviousRange := st.hasCurrentRange
+            st.currentHigh := na
+            st.currentLow := na
+            st.currentHighTime := na
+            st.currentLowTime := na
+            st.currentHighBar := na
+            st.currentLowBar := na
+            st.hasCurrentRange := false
+            st.cycleKey := rangeKey
+        if dataReady and st.cycleKey == rangeKey
+            if na(st.currentHigh) or srcHigh > st.currentHigh
+                st.currentHigh := srcHigh
+                st.currentHighTime := srcTime
+                st.currentHighBar := bar_index
+            if na(st.currentLow) or srcLow < st.currentLow
+                st.currentLow := srcLow
+                st.currentLowTime := srcTime
+                st.currentLowBar := bar_index
+            st.hasCurrentRange := true
+        array.set(smt_range_states, idx, st)
+    0
+
+f_smt_get_state(int cycleIdx, int srcIdx) =>
+    array.get(smt_range_states, f_smt_state_idx(cycleIdx, srcIdx))
+
+// Inverse pairs are normalized once into main-domain high/low liquidity actions.
+f_smt_build_sweeps(SmtRangeState st, bool inverse) =>
+    bool ready = st.hasCurrentRange and st.hasPreviousRange
+    float highA = inverse ? st.previousLow : st.previousHigh
+    float highB = inverse ? st.currentLow : st.currentHigh
+    float lowA = inverse ? st.previousHigh : st.previousLow
+    float lowB = inverse ? st.currentHigh : st.currentLow
+    int highTimeA = inverse ? st.previousLowTime : st.previousHighTime
+    int highTimeB = inverse ? st.currentLowTime : st.currentHighTime
+    int lowTimeA = inverse ? st.previousHighTime : st.previousLowTime
+    int lowTimeB = inverse ? st.currentHighTime : st.currentLowTime
+    int highBarA = inverse ? st.previousLowBar : st.previousHighBar
+    int highBarB = inverse ? st.currentLowBar : st.currentHighBar
+    int lowBarA = inverse ? st.previousHighBar : st.previousLowBar
+    int lowBarB = inverse ? st.currentHighBar : st.currentLowBar
+    bool highSweep = ready and (inverse ? f_smt_low_swept(highB, highA) : f_smt_high_swept(highB, highA))
+    bool lowSweep = ready and (inverse ? f_smt_high_swept(lowB, lowA) : f_smt_low_swept(lowB, lowA))
+    SmtSweepState.new(ready, highSweep, lowSweep, highA, highB, lowA, lowB, highTimeA, highTimeB, lowTimeA, lowTimeB, highBarA, highBarB, lowBarA, lowBarB)
+
+f_smt_xor(bool first, bool second) =>
+    (first and not second) or (not first and second)
+
+// Pure divergence truth: exactly one synchronized market sweeps corresponding liquidity.
+f_smt_resolve_pair_state(SmtSweepState mainSweep, SmtSweepState pairSweep) =>
+    bool ready = mainSweep.ready and pairSweep.ready
+    bool bearValid = ready and f_smt_xor(mainSweep.highSwept, pairSweep.highSwept)
+    bool bullValid = ready and f_smt_xor(mainSweep.lowSwept, pairSweep.lowSwept)
+    [bearValid, bullValid]
+
+// -----------------------------------------------------------------------------
+// Session and time projection policy
+// -----------------------------------------------------------------------------
+f_smt_time_to_minutes(string t) =>
+    array<string> parts = str.split(t, ":")
+    int h = array.size(parts) > 0 ? int(str.tonumber(array.get(parts, 0))) : 0
+    int m = array.size(parts) > 1 ? int(str.tonumber(array.get(parts, 1))) : 0
+    h * 60 + m
+
+f_smt_minutes_in_window(int tMin, int startMin, int endMin) =>
+    startMin <= endMin ? (tMin >= startMin and tMin <= endMin) : (tMin >= startMin or tMin <= endMin)
+
+var int smt_session_1_start_min = f_smt_time_to_minutes(smt_session_1_start)
+var int smt_session_1_end_min = f_smt_time_to_minutes(smt_session_1_end)
+var int smt_session_2_start_min = f_smt_time_to_minutes(smt_session_2_start)
+var int smt_session_2_end_min = f_smt_time_to_minutes(smt_session_2_end)
+var int smt_session_3_start_min = f_smt_time_to_minutes(smt_session_3_start)
+var int smt_session_3_end_min = f_smt_time_to_minutes(smt_session_3_end)
+var int smt_session_4_start_min = f_smt_time_to_minutes(smt_session_4_start)
+var int smt_session_4_end_min = f_smt_time_to_minutes(smt_session_4_end)
+
+smt_session_filter_effective = smt_session_filter_on and not na(tf_sec) and tf_sec <= TF_SEC_30
+smt_current_day_filter_effective = smt_render_current_day_only and not na(tf_sec) and tf_sec < TF_SEC_240
+smt_render_day_ref = last_bar_time
+smt_render_day_start = timestamp(oracle_tz, year(smt_render_day_ref, oracle_tz), month(smt_render_day_ref, oracle_tz), dayofmonth(smt_render_day_ref, oracle_tz), 0, 0)
+smt_render_day_end = timestamp(oracle_tz, year(smt_render_day_ref, oracle_tz), month(smt_render_day_ref, oracle_tz), dayofmonth(smt_render_day_ref, oracle_tz) + 1, 0, 0)
+
+smt_auto_reference_time = last_bar_time
+smt_auto_current_minutes = smt_session_filter_effective and smt_auto_session_filter ? hour(smt_auto_reference_time, "America/New_York") * 60 + minute(smt_auto_reference_time, "America/New_York") : na
+smt_auto_session_1_active = smt_session_filter_effective and smt_auto_session_filter and f_smt_minutes_in_window(smt_auto_current_minutes, smt_session_1_start_min, smt_session_1_end_min)
+smt_auto_session_2_active = smt_session_filter_effective and smt_auto_session_filter and not smt_auto_session_1_active and f_smt_minutes_in_window(smt_auto_current_minutes, smt_session_2_start_min, smt_session_2_end_min)
+smt_auto_session_3_active = smt_session_filter_effective and smt_auto_session_filter and not smt_auto_session_1_active and not smt_auto_session_2_active and f_smt_minutes_in_window(smt_auto_current_minutes, smt_session_3_start_min, smt_session_3_end_min)
+smt_auto_session_4_active = smt_session_filter_effective and smt_auto_session_filter and not smt_auto_session_1_active and not smt_auto_session_2_active and not smt_auto_session_3_active and f_smt_minutes_in_window(smt_auto_current_minutes, smt_session_4_start_min, smt_session_4_end_min)
+
+f_smt_session_render_ok(int pivotBTime) =>
+    bool ok = true
+    if smt_session_filter_effective
+        ok := false
+        if not na(pivotBTime)
+            int pivotMinutes = hour(pivotBTime, "America/New_York") * 60 + minute(pivotBTime, "America/New_York")
+            if smt_auto_session_filter
+                ok := smt_auto_session_1_active ? f_smt_minutes_in_window(pivotMinutes, smt_session_1_start_min, smt_session_1_end_min) : smt_auto_session_2_active ? f_smt_minutes_in_window(pivotMinutes, smt_session_2_start_min, smt_session_2_end_min) : smt_auto_session_3_active ? f_smt_minutes_in_window(pivotMinutes, smt_session_3_start_min, smt_session_3_end_min) : smt_auto_session_4_active ? f_smt_minutes_in_window(pivotMinutes, smt_session_4_start_min, smt_session_4_end_min) : false
+            else
+                bool inSession1 = smt_session_1_on and f_smt_minutes_in_window(pivotMinutes, smt_session_1_start_min, smt_session_1_end_min)
+                bool inSession2 = smt_session_2_on and f_smt_minutes_in_window(pivotMinutes, smt_session_2_start_min, smt_session_2_end_min)
+                bool inSession3 = smt_session_3_on and f_smt_minutes_in_window(pivotMinutes, smt_session_3_start_min, smt_session_3_end_min)
+                bool inSession4 = smt_session_4_on and f_smt_minutes_in_window(pivotMinutes, smt_session_4_start_min, smt_session_4_end_min)
+                ok := inSession1 or inSession2 or inSession3 or inSession4
+    ok
+
+f_smt_current_day_render_ok(int pivotBTime) =>
+    not smt_current_day_filter_effective or (not na(pivotBTime) and pivotBTime >= smt_render_day_start and pivotBTime < smt_render_day_end)
+
+f_smt_render_time_ok(int pivotBTime) =>
+    f_smt_session_render_ok(pivotBTime) and f_smt_current_day_render_ok(pivotBTime)
+
+f_smt_nearby_render_ok(int pivotBBar) =>
+    not smt_render_nearby_only or (not na(pivotBBar) and pivotBBar >= last_bar_index - smt_nearby_bars)
+
+// -----------------------------------------------------------------------------
+// Domain event lifecycle
+// -----------------------------------------------------------------------------
+f_smt_find_event_by_id(int eventId) =>
+    int idx = -1
+    int i = 0
+    while i < array.size(smt_events) and idx < 0
+        if array.get(smt_events, i).id == eventId
+            idx := i
+        i += 1
+    idx
+
+f_smt_drop_render_at(int idx) =>
+    if idx >= 0 and idx < array.size(smt_events)
+        SmtEvent event = array.get(smt_events, idx)
+        if not na(event.labelId)
+            label.delete(event.labelId)
+            event.labelId := na
+        if not na(event.lineId)
+            line.delete(event.lineId)
+            event.lineId := na
+        array.set(smt_events, idx, event)
+    0
+
+f_smt_delete_event_at(int idx) =>
+    bool deleted = false
+    if idx >= 0 and idx < array.size(smt_events)
+        f_smt_drop_render_at(idx)
+        array.remove(smt_events, idx)
+        deleted := true
+    deleted
+
+f_smt_release_live_slot(int slot) =>
+    if slot >= 0 and slot < array.size(smt_live_slots)
+        SmtLiveSlot live = array.get(smt_live_slots, slot)
+        live.active := false
+        live.eventId := na
+        live.cycleKey := na
+        array.set(smt_live_slots, slot, live)
+    0
+
+f_smt_remove_live_slot(int slot) =>
+    if slot >= 0 and slot < array.size(smt_live_slots)
+        SmtLiveSlot live = array.get(smt_live_slots, slot)
+        if live.active and not na(live.eventId)
+            int eventIdx = f_smt_find_event_by_id(live.eventId)
+            if eventIdx >= 0
+                f_smt_delete_event_at(eventIdx)
+        f_smt_release_live_slot(slot)
+    0
+
+// Returns true if this call just finalized (LIVE→CONFIRMED) the slot's event.
+f_smt_finalize_live_slot(int slot, int currentCycle) =>
+    bool finalized = false
+    if slot >= 0 and slot < array.size(smt_live_slots)
+        SmtLiveSlot live = array.get(smt_live_slots, slot)
+        if live.active and not na(currentCycle) and not na(live.cycleKey) and currentCycle != live.cycleKey
+            int eventIdx = f_smt_find_event_by_id(live.eventId)
+            if eventIdx >= 0
+                SmtEvent event = array.get(smt_events, eventIdx)
+                if event.state == SMT_EVENT_LIVE
+                    event.state := SMT_EVENT_CONFIRMED
+                    event.projectA := false
+                    event.projectB := false
+                    event.bypassed := false
+                    array.set(smt_events, eventIdx, event)
+                    finalized := true
+            f_smt_release_live_slot(slot)
+    finalized
+
+f_smt_sync_live_candidate(bool valid, int cycleKey, int previousCycleKey, int rank, int pairSlot, int dir, float y1, float y2, int t1, int t2, int b1, int b2) =>
+    int slot = f_smt_live_slot(rank, pairSlot, dir)
+    SmtLiveSlot live = array.get(smt_live_slots, slot)
+    bool fieldsReady = not na(cycleKey) and not na(previousCycleKey) and not na(y1) and not na(y2) and not na(t1) and not na(t2) and not na(b1) and not na(b2)
+    if live.active and (not valid or not fieldsReady or live.cycleKey != cycleKey)
+        f_smt_remove_live_slot(slot)
+        live := array.get(smt_live_slots, slot)
+    if valid and fieldsReady
+        int eventId = f_smt_event_id(rank, pairSlot, dir, cycleKey)
+        int eventIdx = live.active ? f_smt_find_event_by_id(live.eventId) : -1
+        if eventIdx < 0
+            bool bodyBlocked = f_smt_body_filter_applies(rank) and f_smt_body_intersects(b1, b2, y1, y2)
+            SmtEvent event = SmtEvent.new(eventId, rank, pairSlot, dir, cycleKey, previousCycleKey, y1, y2, t1, t2, b1, b2, f_smt_structure_type(dir == SMT_DIR_BULL, y1, y2), SMT_EVENT_LIVE, bodyBlocked, na, na, false, false, false)
+            array.unshift(smt_events, event)
+            live.active := true
+            live.eventId := eventId
+            live.cycleKey := cycleKey
+            array.set(smt_live_slots, slot, live)
+        else
+            SmtEvent event = array.get(smt_events, eventIdx)
+            bool pivotChanged = event.pivotAPrice != y1 or event.pivotBPrice != y2 or event.pivotATime != t1 or event.pivotBTime != t2 or event.pivotABar != b1 or event.pivotBBar != b2
+            if pivotChanged
+                event.pivotAPrice := y1
+                event.pivotBPrice := y2
+                event.pivotATime := t1
+                event.pivotBTime := t2
+                event.pivotABar := b1
+                event.pivotBBar := b2
+                event.structType := f_smt_structure_type(dir == SMT_DIR_BULL, y1, y2)
+                event.bodyBlocked := f_smt_body_filter_applies(rank) and f_smt_body_intersects(b1, b2, y1, y2)
+                array.set(smt_events, eventIdx, event)
+    0
+
+f_smt_event_invalidated(SmtEvent event) =>
+    event.state == SMT_EVENT_CONFIRMED and bar_index > event.pivotBBar and ((event.dir == SMT_DIR_BEAR and high >= event.pivotBPrice) or (event.dir == SMT_DIR_BULL and low <= event.pivotBPrice))
+
+f_smt_mark_historical_invalidations() =>
+    int n = array.size(smt_events)
+    if n > 0
+        for i = n - 1 to 0
+            SmtEvent event = array.get(smt_events, i)
+            if f_smt_event_invalidated(event)
+                event.state := SMT_EVENT_INVALIDATED
+                event.projectA := false
+                event.projectB := false
+                array.set(smt_events, i, event)
+    0
+
+f_smt_gc_events() =>
+    int i = array.size(smt_events) - 1
+    while i >= 0
+        if array.get(smt_events, i).state == SMT_EVENT_INVALIDATED
+            f_smt_delete_event_at(i)
+        i -= 1
+    while array.size(smt_events) > SMT_DOMAIN_EVENT_CAP
+        int removeIdx = array.size(smt_events) - 1
+        while removeIdx >= 0 and array.get(smt_events, removeIdx).state == SMT_EVENT_LIVE
+            removeIdx -= 1
+        if removeIdx >= 0
+            f_smt_delete_event_at(removeIdx)
+        else
+            break
+    0
+
+// -----------------------------------------------------------------------------
+// Deterministic render projection and arbitration
+// -----------------------------------------------------------------------------
+f_smt_event_base_render_ok(SmtEvent event) =>
+    bool activeState = event.state == SMT_EVENT_LIVE or event.state == SMT_EVENT_CONFIRMED
+    activeState and f_smt_rank_enabled(event.rank) and f_smt_pair_enabled(event.pairSlot) and f_smt_monthly_tf_render_ok(event.rank) and f_smt_nearby_render_ok(event.pivotBBar) and f_smt_render_time_ok(event.pivotBTime) and not event.bodyBlocked
+
+f_smt_hard_winner(SmtEvent dominant, SmtEvent candidate) =>
+    dominant.rank > candidate.rank or (dominant.rank == candidate.rank and dominant.pairSlot < candidate.pairSlot) or (dominant.rank == candidate.rank and dominant.pairSlot == candidate.pairSlot and dominant.id < candidate.id)
+
+f_smt_hard_loses(int idx) =>
+    bool loses = false
+    SmtEvent candidate = array.get(smt_events, idx)
+    int n = array.size(smt_events)
+    if candidate.projectA and candidate.dir != 0 and not na(candidate.pivotATime) and not na(candidate.pivotBTime) and n > 1
+        for i = 0 to n - 1
+            if i != idx and not loses
+                SmtEvent other = array.get(smt_events, i)
+                bool sameEvent = other.projectA and other.dir == candidate.dir and other.pivotATime == candidate.pivotATime and other.pivotBTime == candidate.pivotBTime
+                loses := sameEvent and f_smt_hard_winner(other, candidate)
+    loses
+
+f_smt_inside_dominates(SmtEvent keeper, SmtEvent candidate) =>
+    int keepLeft = math.min(keeper.pivotABar, keeper.pivotBBar)
+    int keepRight = math.max(keeper.pivotABar, keeper.pivotBBar)
+    int candidateLeft = math.min(candidate.pivotABar, candidate.pivotBBar)
+    int candidateRight = math.max(candidate.pivotABar, candidate.pivotBBar)
+    int keepSpan = keepRight - keepLeft
+    int candidateSpan = candidateRight - candidateLeft
+    bool directionOk = keeper.dir != 0 and keeper.dir == candidate.dir
+    bool structureOk = f_smt_cleanup_struct_ok(candidate.rank, candidate.structType, keeper.structType)
+    bool priorityOk = keeper.rank > candidate.rank or (keeper.rank == candidate.rank and keepSpan > candidateSpan)
+    candidateLeft >= keepLeft + 1 and candidateRight <= keepRight - 1 and keepSpan > candidateSpan and candidateSpan > 0 and keepSpan >= 3 and directionOk and structureOk and priorityOk
+
+f_smt_inside_loses(int idx) =>
+    bool loses = false
+    SmtEvent candidate = array.get(smt_events, idx)
+    int n = array.size(smt_events)
+    if candidate.projectB and n > 1
+        for i = 0 to n - 1
+            if i != idx and not loses
+                SmtEvent keeper = array.get(smt_events, i)
+                loses := keeper.projectB and f_smt_inside_dominates(keeper, candidate)
+    loses
+
+f_smt_pivot_winner(SmtEvent dominant, SmtEvent candidate) =>
+    dominant.rank > candidate.rank or (dominant.rank == candidate.rank and dominant.id < candidate.id)
+
+f_smt_pivot_loses(int idx, bool checkPivotA) =>
+    bool loses = false
+    SmtEvent candidate = array.get(smt_events, idx)
+    int n = array.size(smt_events)
+    if candidate.projectA and candidate.dir != 0 and n > 1
+        for i = 0 to n - 1
+            if i != idx and not loses
+                SmtEvent other = array.get(smt_events, i)
+                bool samePivot = checkPivotA ? other.pivotATime == candidate.pivotATime : other.pivotBTime == candidate.pivotBTime
+                bool directionOk = other.dir == candidate.dir
+                bool structureOk = f_smt_cleanup_struct_ok(candidate.rank, candidate.structType, other.structType)
+                loses := other.projectA and samePivot and directionOk and structureOk and f_smt_pivot_winner(other, candidate)
+    loses
+
+f_smt_prepare_projection() =>
+    int n = array.size(smt_events)
+    if n > 0
+        for i = 0 to n - 1
+            SmtEvent event = array.get(smt_events, i)
+            bool baseEligible = f_smt_event_base_render_ok(event)
+            event.projectA := baseEligible
+            event.projectB := baseEligible
+            event.bypassed := false
+            array.set(smt_events, i, event)
+
+        for i = 0 to n - 1
+            SmtEvent event = array.get(smt_events, i)
+            event.projectB := event.projectA and not f_smt_hard_loses(i)
+            array.set(smt_events, i, event)
+
+        bool insideBypassMode = smt_cleanup_mode == "Bypass Inside Range"
+        bool evaluateInside = smt_cleanup_inside or insideBypassMode
+        for i = 0 to n - 1
+            SmtEvent event = array.get(smt_events, i)
+            bool losesInside = evaluateInside and event.projectB and f_smt_inside_loses(i)
+            event.projectA := event.projectB and not (smt_cleanup_inside and losesInside)
+            event.bypassed := smt_aesthetic_bypass and insideBypassMode and losesInside
+            array.set(smt_events, i, event)
+
+        bool pivotABypassMode = smt_cleanup_mode == "Bypass Pivot A"
+        bool pivotBBypassMode = smt_cleanup_mode == "Bypass Pivot B"
+        bool evaluatePivotA = smt_cleanup_pivot_a or pivotABypassMode
+        bool evaluatePivotB = smt_cleanup_pivot_b or pivotBBypassMode
+        for i = 0 to n - 1
+            SmtEvent event = array.get(smt_events, i)
+            bool losesPivotA = evaluatePivotA and event.projectA and f_smt_pivot_loses(i, true)
+            bool losesPivotB = evaluatePivotB and event.projectA and f_smt_pivot_loses(i, false)
+            bool removed = (smt_cleanup_pivot_a and losesPivotA) or (smt_cleanup_pivot_b and losesPivotB)
+            event.projectB := event.projectA and not removed
+            bool pivotBypassed = (pivotABypassMode and losesPivotA) or (pivotBBypassMode and losesPivotB)
+            event.bypassed := event.bypassed or (smt_aesthetic_bypass and pivotBypassed)
+            array.set(smt_events, i, event)
+    0
+
+f_smt_sync_render_at(int idx, bool shouldRender) =>
+    if idx >= 0 and idx < array.size(smt_events)
+        SmtEvent event = array.get(smt_events, idx)
+        if shouldRender
+            color eventColor = event.bypassed ? color.new(f_smt_rank_color(event.rank), 65) : f_smt_rank_color(event.rank)
+            if na(event.lineId)
+                event.lineId := line.new(x1=event.pivotATime, y1=event.pivotAPrice, x2=event.pivotBTime, y2=event.pivotBPrice, xloc=xloc.bar_time, color=eventColor, width=1, style=smt_line_style)
+            else
+                line.set_xy1(event.lineId, event.pivotATime, event.pivotAPrice)
+                line.set_xy2(event.lineId, event.pivotBTime, event.pivotBPrice)
+                line.set_color(event.lineId, eventColor)
+                line.set_style(event.lineId, smt_line_style)
+            bool labelsOn = f_smt_labels_for_rank(event.rank)
+            if labelsOn
+                int labelTime = f_smt_event_label_time(event.pivotATime, event.pivotBTime, event.pivotABar, event.pivotBBar)
+                string defaultText = f_smt_default_label_text(event.rank, event.pairSlot)
+                string displayText = event.bypassed ? (smt_bypass_labels_show ? f_smt_bypass_label_text(event.rank, event.pairSlot) : "") : defaultText
+                color textColor = event.bypassed ? (smt_bypass_labels_show ? color.new(smt_txt_all, 50) : color.new(smt_txt_all, 100)) : smt_txt_all
+                if na(event.labelId)
+                    event.labelId := label.new(x=labelTime, y=f_smt_event_mid_y(event.pivotAPrice, event.pivotBPrice), text=displayText, xloc=xloc.bar_time, yloc=yloc.price, color=color.new(color.white, 100), style=event.dir == SMT_DIR_BULL ? label.style_label_up : label.style_label_down, textcolor=textColor, size=smt_label_size, tooltip=defaultText)
+                else
+                    label.set_x(event.labelId, labelTime)
+                    label.set_y(event.labelId, f_smt_event_mid_y(event.pivotAPrice, event.pivotBPrice))
+                    label.set_text(event.labelId, displayText)
+                    label.set_textcolor(event.labelId, textColor)
+                    label.set_size(event.labelId, smt_label_size)
+            else if not na(event.labelId)
+                label.delete(event.labelId)
+                event.labelId := na
+        else
+            if not na(event.labelId)
+                label.delete(event.labelId)
+                event.labelId := na
+            if not na(event.lineId)
+                line.delete(event.lineId)
+                event.lineId := na
+        array.set(smt_events, idx, event)
+    0
+
+f_smt_project_events() =>
+    if barstate.islast
+        f_smt_prepare_projection()
+        array<int> bucketCounts = array.new_int(SMT_LIVE_SLOTS, 0)
+        int rendered = 0
+        int n = array.size(smt_events)
+        if n > 0
+            for rankCursor = SMT_STATE_CYCLES to 1
+                for i = 0 to n - 1
+                    SmtEvent event = array.get(smt_events, i)
+                    if event.rank == rankCursor
+                        bool shouldRender = event.projectB
+                        if shouldRender and event.state == SMT_EVENT_CONFIRMED
+                            int bucket = f_smt_live_slot(event.rank, event.pairSlot, event.dir)
+                            int bucketCount = array.get(bucketCounts, bucket)
+                            shouldRender := bucketCount < smt_history_limit
+                            if shouldRender
+                                array.set(bucketCounts, bucket, bucketCount + 1)
+                        shouldRender := shouldRender and rendered < SMT_RENDER_EVENT_CAP
+                        if shouldRender
+                            rendered += 1
+                        event.projectA := shouldRender
+                        array.set(smt_events, i, event)
+            for i = 0 to n - 1
+                f_smt_sync_render_at(i, array.get(smt_events, i).projectA)
+    0
+
+// -----------------------------------------------------------------------------
+// Family runtime — extended to also report [bearFinalized, bullFinalized] for
+// this bar, so SxM's tCISD arm-trigger (Section 13) can react to the exact
+// same CONFIRMED edge GXV's own rendering reacts to.
+// -----------------------------------------------------------------------------
+f_smt_run_pair(SmtRangeState mainState, SmtRangeState pairState, bool engineEnabled, SmtCorrelationDescriptor pair, int rank, int pairSlot) =>
+    bool bearFinalized = false
+    bool bullFinalized = false
+    if not na(mainState.cycleKey)
+        int bearSlot = f_smt_live_slot(rank, pairSlot, SMT_DIR_BEAR)
+        int bullSlot = f_smt_live_slot(rank, pairSlot, SMT_DIR_BULL)
+        // Finalization belongs to the main range transition and never to a line.
+        bearFinalized := f_smt_finalize_live_slot(bearSlot, mainState.cycleKey)
+        bullFinalized := f_smt_finalize_live_slot(bullSlot, mainState.cycleKey)
+        bool cycleAligned = mainState.cycleKey == pairState.cycleKey and not na(mainState.previousCycleKey) and mainState.previousCycleKey == pairState.previousCycleKey
+        bool rangesReady = mainState.hasCurrentRange and mainState.hasPreviousRange and pairState.hasCurrentRange and pairState.hasPreviousRange
+        bool canResolve = engineEnabled and pair.configured and pair.dataReady and cycleAligned and rangesReady
+        if canResolve
+            SmtSweepState mainSweep = f_smt_build_sweeps(mainState, false)
+            SmtSweepState pairSweep = f_smt_build_sweeps(pairState, pair.inverse)
+            [bearValid, bullValid] = f_smt_resolve_pair_state(mainSweep, pairSweep)
+            f_smt_sync_live_candidate(bearValid, mainState.cycleKey, mainState.previousCycleKey, rank, pairSlot, SMT_DIR_BEAR, mainSweep.highPivotA, mainSweep.highPivotB, mainSweep.highTimeA, mainSweep.highTimeB, mainSweep.highBarA, mainSweep.highBarB)
+            f_smt_sync_live_candidate(bullValid, mainState.cycleKey, mainState.previousCycleKey, rank, pairSlot, SMT_DIR_BULL, mainSweep.lowPivotA, mainSweep.lowPivotB, mainSweep.lowTimeA, mainSweep.lowTimeB, mainSweep.lowBarA, mainSweep.lowBarB)
+        else
+            f_smt_sync_live_candidate(false, mainState.cycleKey, mainState.previousCycleKey, rank, pairSlot, SMT_DIR_BEAR, na, na, na, na, na, na)
+            f_smt_sync_live_candidate(false, mainState.cycleKey, mainState.previousCycleKey, rank, pairSlot, SMT_DIR_BULL, na, na, na, na, na, na)
+    [bearFinalized, bullFinalized]
+
+f_run_smt_cycle(int cycleIdx, bool engineEnabled, int rangeKey, int rank) =>
+    f_smt_update_state(cycleIdx, SMT_SRC_MAIN, engineEnabled, rangeKey, high, low, time)
+    f_smt_update_state(cycleIdx, SMT_SRC_PAIR1, engineEnabled and smt_corr_pair1.configured, rangeKey, smt_corr_pair1.sourceHigh, smt_corr_pair1.sourceLow, smt_corr_pair1.sourceTime)
+    f_smt_update_state(cycleIdx, SMT_SRC_PAIR2, engineEnabled and smt_corr_pair2.configured, rangeKey, smt_corr_pair2.sourceHigh, smt_corr_pair2.sourceLow, smt_corr_pair2.sourceTime)
+    f_smt_update_state(cycleIdx, SMT_SRC_PAIR3, engineEnabled and smt_corr_pair3.configured, rangeKey, smt_corr_pair3.sourceHigh, smt_corr_pair3.sourceLow, smt_corr_pair3.sourceTime)
+    SmtRangeState mainState = f_smt_get_state(cycleIdx, SMT_SRC_MAIN)
+    SmtRangeState pair1State = f_smt_get_state(cycleIdx, SMT_SRC_PAIR1)
+    SmtRangeState pair2State = f_smt_get_state(cycleIdx, SMT_SRC_PAIR2)
+    SmtRangeState pair3State = f_smt_get_state(cycleIdx, SMT_SRC_PAIR3)
+    [bear1, bull1] = f_smt_run_pair(mainState, pair1State, engineEnabled, smt_corr_pair1, rank, 1)
+    [bear2, bull2] = f_smt_run_pair(mainState, pair2State, engineEnabled, smt_corr_pair2, rank, 2)
+    [bear3, bull3] = f_smt_run_pair(mainState, pair3State, engineEnabled, smt_corr_pair3, rank, 3)
+    // Only ranks/pairs actually enabled for display can arm tCISD — a
+    // disabled rank computes internally (for arbitration) but stays silent.
+    bool rankOn = f_smt_rank_enabled(rank)
+    bool anyBear = rankOn and ((f_smt_pair_enabled(1) and bear1) or (f_smt_pair_enabled(2) and bear2) or (f_smt_pair_enabled(3) and bear3))
+    bool anyBull = rankOn and ((f_smt_pair_enabled(1) and bull1) or (f_smt_pair_enabled(2) and bull2) or (f_smt_pair_enabled(3) and bull3))
+    [anyBear, anyBull]
+
+// -----------------------------------------------------------------------------
+// GXV SMT execution — all 13 ranks, every bar. Aggregated into the same two
+// booleans tCISD already arms from.
+// -----------------------------------------------------------------------------
+f_smt_seed_engine()
+
+bool bearishSSMTEvent = false
+bool bullishSSMTEvent = false
+string bearSsmtRankTag = ""
+string bullSsmtRankTag = ""
+
+[r12bear, r12bull] = f_run_smt_cycle(12, tf_ok_12m, val_sesY, 13)
+[r11bear, r11bull] = f_run_smt_cycle(11, tf_ok_3m, val_sesQ, 12)
+[r10bear, r10bull] = f_run_smt_cycle(10, tf_ok_1m, val_sesMT, 11)
+[r9bear, r9bull]   = f_run_smt_cycle(9, tf_ok_1w, val_sesM, 10)
+[r8bear, r8bull]   = f_run_smt_cycle(8, tf_ok_1d, val_sesW, 9)
+[r7bear, r7bull]   = f_run_smt_cycle(7, tf_ok_12h, val_ses720, 8)
+[r6bear, r6bull]   = f_run_smt_cycle(6, tf_ok_7h, val_ses420, 7)
+[r5bear, r5bull]   = f_run_smt_cycle(5, tf_ok_6h, val_sesD, 6)
+[r4bear, r4bull]   = f_run_smt_cycle(4, tf_ok_4h, val_ses240, 5)
+[r3bear, r3bull]   = f_run_smt_cycle(3, tf_ok_90m, val_ses90, 4)
+[r2bear, r2bull]   = f_run_smt_cycle(2, tf_ok_1h, val_ses60, 3)
+[r1bear, r1bull]   = f_run_smt_cycle(1, tf_ok_30m, val_ses30, 2)
+[r0bear, r0bull]   = f_run_smt_cycle(0, tf_ok_15m, val_ses15, 1)
+
+bearishSSMTEvent := r12bear or r11bear or r10bear or r9bear or r8bear or r7bear or r6bear or r5bear or r4bear or r3bear or r2bear or r1bear or r0bear
+bullishSSMTEvent := r12bull or r11bull or r10bull or r9bull or r8bull or r7bull or r6bull or r5bull or r4bull or r3bull or r2bull or r1bull or r0bull
+
+// Which rank(s) actually fired this bar — so the arm-evidence marker can
+// name e.g. "SSMT 4H" instead of a generic "SSMT" when the source is a
+// higher timeframe than the chart you're looking at.
+f_smt_append_tag(string tag, bool fired, int rank) =>
+    fired ? (tag == "" ? f_smt_rank_shortname(rank) : tag + "+" + f_smt_rank_shortname(rank)) : tag
+
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r12bear, 13)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r11bear, 12)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r10bear, 11)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r9bear, 10)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r8bear, 9)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r7bear, 8)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r6bear, 7)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r5bear, 6)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r4bear, 5)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r3bear, 4)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r2bear, 3)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r1bear, 2)
+bearSsmtRankTag := f_smt_append_tag(bearSsmtRankTag, r0bear, 1)
+
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r12bull, 13)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r11bull, 12)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r10bull, 11)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r9bull, 10)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r8bull, 9)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r7bull, 8)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r6bull, 7)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r5bull, 6)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r4bull, 5)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r3bull, 4)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r2bull, 3)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r1bull, 2)
+bullSsmtRankTag := f_smt_append_tag(bullSsmtRankTag, r0bull, 1)
+
+
+
+// Check newly confirmed events on the rollover bar itself.
+f_smt_mark_historical_invalidations()
+f_smt_gc_events()
+f_smt_project_events()
+
+
+// =============================================================================
+// 11. HTF SSMT → MTF tCISD ALIGNMENT (unchanged from v2/v3 — permission gate)
+// =============================================================================
+
+string G_ALIGN = "HTF SSMT -> MTF tCISD"
+
+bool   useHTFSSMTAlignment = input.bool(false, "Enable HTF SSMT -> MTF tCISD", group=G_ALIGN)
+string ssmtHTF             = input.timeframe("240", "Higher Timeframe SSMT", group=G_ALIGN)
+int    htfSignalLifeBars   = input.int(100, "HTF SSMT Validity Bars", minval=1, maxval=1000, group=G_ALIGN)
+
+float htfMainPH = request.security(syminfo.tickerid, ssmtHTF, ta.pivothigh(high, ssmtLength, ssmtLength), lookahead=barmerge.lookahead_off)
+float htfMainPL = request.security(syminfo.tickerid, ssmtHTF, ta.pivotlow(low, ssmtLength, ssmtLength),  lookahead=barmerge.lookahead_off)
+float htfSym1PH = request.security(sym1, ssmtHTF, ta.pivothigh(high, ssmtLength, ssmtLength), lookahead=barmerge.lookahead_off)
+float htfSym1PL = request.security(sym1, ssmtHTF, ta.pivotlow(low, ssmtLength, ssmtLength),  lookahead=barmerge.lookahead_off)
+float htfSym2PH = request.security(sym2, ssmtHTF, ta.pivothigh(high, ssmtLength, ssmtLength), lookahead=barmerge.lookahead_off)
+float htfSym2PL = request.security(sym2, ssmtHTF, ta.pivotlow(low, ssmtLength, ssmtLength),  lookahead=barmerge.lookahead_off)
+
+var float prevHTFPH = na
+var float prevHTFSym1PH = na
+var float prevHTFSym2PH = na
+var float prevHTFPL = na
+var float prevHTFSym1PL = na
+var float prevHTFSym2PL = na
+
+bool newHTFHigh = not na(htfMainPH) and na(htfMainPH[1])
+bool newHTFLow  = not na(htfMainPL) and na(htfMainPL[1])
+
+bool htfBullSSMT = false
+bool htfBearSSMT = false
+
+if newHTFHigh
+    bool bear1 = false
+    bool bear2 = false
+    bool newSym1 = useSym1 and not na(htfSym1PH)
+    bool newSym2 = useSym2 and not na(htfSym2PH)
+    if newSym1 and not na(prevHTFPH) and not na(prevHTFSym1PH)
+        bear1 := (htfMainPH > prevHTFPH and htfSym1PH < prevHTFSym1PH) or (htfMainPH < prevHTFPH and htfSym1PH > prevHTFSym1PH)
+    if newSym2 and not na(prevHTFPH) and not na(prevHTFSym2PH)
+        bear2 := (htfMainPH > prevHTFPH and htfSym2PH < prevHTFSym2PH) or (htfMainPH < prevHTFPH and htfSym2PH > prevHTFSym2PH)
+    htfBearSSMT := bear1 or bear2
+    prevHTFPH := htfMainPH
+    if newSym1
+        prevHTFSym1PH := htfSym1PH
+    if newSym2
+        prevHTFSym2PH := htfSym2PH
+
+if newHTFLow
+    bool bull1 = false
+    bool bull2 = false
+    bool newSym1b = useSym1 and not na(htfSym1PL)
+    bool newSym2b = useSym2 and not na(htfSym2PL)
+    if newSym1b and not na(prevHTFPL) and not na(prevHTFSym1PL)
+        bull1 := (htfMainPL < prevHTFPL and htfSym1PL > prevHTFSym1PL) or (htfMainPL > prevHTFPL and htfSym1PL < prevHTFSym1PL)
+    if newSym2b and not na(prevHTFPL) and not na(prevHTFSym2PL)
+        bull2 := (htfMainPL < prevHTFPL and htfSym2PL > prevHTFSym2PL) or (htfMainPL > prevHTFPL and htfSym2PL < prevHTFSym2PL)
+    htfBullSSMT := bull1 or bull2
+    prevHTFPL := htfMainPL
+    if newSym1b
+        prevHTFSym1PL := htfSym1PL
+    if newSym2b
+        prevHTFSym2PL := htfSym2PL
+
+var int htfDirection = 0
+var int htfSignalBar = na
+
+if htfBullSSMT
+    htfDirection := 1
+    htfSignalBar := bar_index
+if htfBearSSMT
+    htfDirection := -1
+    htfSignalBar := bar_index
+
+bool htfSignalActive = not na(htfSignalBar) and bar_index - htfSignalBar <= htfSignalLifeBars
+
+if not htfSignalActive
+    htfDirection := 0
+    htfSignalBar := na
+
+bool bullAlignmentOK = not useHTFSSMTAlignment or (htfSignalActive and htfDirection == 1)
+bool bearAlignmentOK = not useHTFSSMTAlignment or (htfSignalActive and htfDirection == -1)
+
+
+// =============================================================================
+// 12. TURTLE SOUP (unchanged from v2/v3)
+// =============================================================================
+
+string G_TS = "Turtle Soup"
+
+int    tsLookback  = input.int(5, "Swing Lookback", minval=5, maxval=60, group=G_TS)
+int    maxSweeps   = input.int(20, "Max Sweeps Displayed (per timeframe)", minval=1, maxval=200, group=G_TS)
+bool   showSweeps  = input.bool(true, "Show Turtle Soups", group=G_TS)
+bool   showCurrentTF = input.bool(true, "Show Current TF", group=G_TS)
+bool   showHTF1 = input.bool(false, "Show HTF 1", inline="tf1", group=G_TS)
+string tf1 = input.timeframe("15", "", inline="tf1", group=G_TS)
+bool   showHTF2 = input.bool(false, "Show HTF 2", inline="tf2", group=G_TS)
+string tf2 = input.timeframe("60", "", inline="tf2", group=G_TS)
+bool   showHTF3 = input.bool(false, "Show HTF 3", inline="tf3", group=G_TS)
+string tf3 = input.timeframe("240", "", inline="tf3", group=G_TS)
+bool   showHTF4 = input.bool(false, "Show HTF 4", inline="tf4", group=G_TS)
+string tf4 = input.timeframe("1D", "", inline="tf4", group=G_TS)
+bool   showHTF5 = input.bool(false, "Show HTF 5", inline="tf5", group=G_TS)
+string tf5 = input.timeframe("1W", "", inline="tf5", group=G_TS)
+bool   labelHTF = input.bool(true, "Label HTF Timeframe on Marker", group=G_TS)
+color  tsColor  = input.color(color.blue, "TS Color", group=G_TS)
+string tsMarker = input.string("💎", "TS Marker", group=G_TS)
+
+f_detectTS() =>
+    float swingHigh = ta.pivothigh(high, tsLookback, tsLookback)
+    float swingLow  = ta.pivotlow(low, tsLookback, tsLookback)
+    var float lastHigh = na
+    var float lastLow  = na
+    var int lastHighTime = na
+    var int lastLowTime  = na
+    if not na(swingHigh)
+        lastHigh := swingHigh
+        lastHighTime := time[tsLookback]
+    if not na(swingLow)
+        lastLow := swingLow
+        lastLowTime := time[tsLookback]
+    bool bull = not na(lastLow) and low < lastLow and close > lastLow
+    bool bear = not na(lastHigh) and high > lastHigh and close < lastHigh
+    [bull, bear, lastHigh, lastLow, lastHighTime, lastLowTime]
+
+f_pushTS(array<line> lines, array<label> labels, line ln, label lb, int maxCount) =>
+    array.push(lines, ln)
+    array.push(labels, lb)
+    while array.size(lines) > maxCount
+        line.delete(array.shift(lines))
+        label.delete(array.shift(labels))
+    true
+
+var array<line>  tsLinesCur = array.new_line()
+var array<label> tsLabelsCur = array.new_label()
+var int lastTSBullTime = na
+var int lastTSBearTime = na
+
+bool  tsBullCurEvent = false
+bool  tsBearCurEvent = false
+float tsBullCurLow   = na
+float tsBearCurHigh  = na
+
+if showCurrentTF
+    [tsBull, tsBear, tsHigh, tsLow, tsHighTime, tsLowTime] = f_detectTS()
+
+    if tsBull and (na(lastTSBullTime) or lastTSBullTime != time)
+        lastTSBullTime := time
+        tsBullCurEvent := true
+        tsBullCurLow := tsLow
+        if showSweeps
+            lnCur = line.new(tsLowTime, tsLow, time, tsLow, xloc=xloc.bar_time, color=tsColor, style=line.style_dotted)
+            lbCur = label.new(time, tsLow, tsMarker, xloc=xloc.bar_time, style=label.style_label_up, color=color.new(tsColor, 100), textcolor=tsColor, size=size.tiny)
+            f_pushTS(tsLinesCur, tsLabelsCur, lnCur, lbCur, maxSweeps)
+
+    if tsBear and (na(lastTSBearTime) or lastTSBearTime != time)
+        lastTSBearTime := time
+        tsBearCurEvent := true
+        tsBearCurHigh := tsHigh
+        if showSweeps
+            lnCur2 = line.new(tsHighTime, tsHigh, time, tsHigh, xloc=xloc.bar_time, color=tsColor, style=line.style_dotted)
+            lbCur2 = label.new(time, tsHigh, tsMarker, xloc=xloc.bar_time, style=label.style_label_down, color=color.new(tsColor, 100), textcolor=tsColor, size=size.tiny)
+            f_pushTS(tsLinesCur, tsLabelsCur, lnCur2, lbCur2, maxSweeps)
+
+f_htfTS(simple string tf) =>
+    [b, r, sh, sl, shTime, slTime] = request.security(syminfo.tickerid, tf, f_detectTS(), lookahead=barmerge.lookahead_off)
+    int srcTime = request.security(syminfo.tickerid, tf, time, lookahead=barmerge.lookahead_off)
+    [b, r, sh, sl, shTime, slTime, srcTime]
+
+f_processHTFTS(array<line> lines, array<label> labels, bool bull, bool bear, float sh, float sl, int shTime, int slTime, bool isNewSource, string tfLabel, int maxCount) =>
+    if isNewSource and showSweeps
+        if bull
+            string txtB = (labelHTF ? tfLabel + " " : "") + tsMarker
+            lnB = line.new(slTime, sl, time, sl, xloc=xloc.bar_time, color=tsColor, style=line.style_dotted)
+            lbB = label.new(time, sl, txtB, xloc=xloc.bar_time, style=label.style_label_up, color=color.new(tsColor, 100), textcolor=tsColor, size=size.tiny)
+            f_pushTS(lines, labels, lnB, lbB, maxCount)
+        if bear
+            string txtS = (labelHTF ? tfLabel + " " : "") + tsMarker
+            lnS = line.new(shTime, sh, time, sh, xloc=xloc.bar_time, color=tsColor, style=line.style_dotted)
+            lbS = label.new(time, sh, txtS, xloc=xloc.bar_time, style=label.style_label_down, color=color.new(tsColor, 100), textcolor=tsColor, size=size.tiny)
+            f_pushTS(lines, labels, lnS, lbS, maxCount)
+    true
+
+var array<line>  tsLinesH1 = array.new_line()
+var array<label> tsLabelsH1 = array.new_label()
+var int lastSrcH1 = na
+if showHTF1
+    [tsB1, tsR1, tsSH1, tsSL1, tsSHT1, tsSLT1, tsST1] = f_htfTS(tf1)
+    bool newSrcH1 = na(lastSrcH1) or tsST1 != lastSrcH1
+    if newSrcH1
+        lastSrcH1 := tsST1
+    f_processHTFTS(tsLinesH1, tsLabelsH1, tsB1, tsR1, tsSH1, tsSL1, tsSHT1, tsSLT1, newSrcH1, tf1, maxSweeps)
+
+var array<line>  tsLinesH2 = array.new_line()
+var array<label> tsLabelsH2 = array.new_label()
+var int lastSrcH2 = na
+if showHTF2
+    [tsB2, tsR2, tsSH2, tsSL2, tsSHT2, tsSLT2, tsST2] = f_htfTS(tf2)
+    bool newSrcH2 = na(lastSrcH2) or tsST2 != lastSrcH2
+    if newSrcH2
+        lastSrcH2 := tsST2
+    f_processHTFTS(tsLinesH2, tsLabelsH2, tsB2, tsR2, tsSH2, tsSL2, tsSHT2, tsSLT2, newSrcH2, tf2, maxSweeps)
+
+var array<line>  tsLinesH3 = array.new_line()
+var array<label> tsLabelsH3 = array.new_label()
+var int lastSrcH3 = na
+if showHTF3
+    [tsB3, tsR3, tsSH3, tsSL3, tsSHT3, tsSLT3, tsST3] = f_htfTS(tf3)
+    bool newSrcH3 = na(lastSrcH3) or tsST3 != lastSrcH3
+    if newSrcH3
+        lastSrcH3 := tsST3
+    f_processHTFTS(tsLinesH3, tsLabelsH3, tsB3, tsR3, tsSH3, tsSL3, tsSHT3, tsSLT3, newSrcH3, tf3, maxSweeps)
+
+var array<line>  tsLinesH4 = array.new_line()
+var array<label> tsLabelsH4 = array.new_label()
+var int lastSrcH4 = na
+if showHTF4
+    [tsB4, tsR4, tsSH4, tsSL4, tsSHT4, tsSLT4, tsST4] = f_htfTS(tf4)
+    bool newSrcH4 = na(lastSrcH4) or tsST4 != lastSrcH4
+    if newSrcH4
+        lastSrcH4 := tsST4
+    f_processHTFTS(tsLinesH4, tsLabelsH4, tsB4, tsR4, tsSH4, tsSL4, tsSHT4, tsSLT4, newSrcH4, tf4, maxSweeps)
+
+var array<line>  tsLinesH5 = array.new_line()
+var array<label> tsLabelsH5 = array.new_label()
+var int lastSrcH5 = na
+if showHTF5
+    [tsB5, tsR5, tsSH5, tsSL5, tsSHT5, tsSLT5, tsST5] = f_htfTS(tf5)
+    bool newSrcH5 = na(lastSrcH5) or tsST5 != lastSrcH5
+    if newSrcH5
+        lastSrcH5 := tsST5
+    f_processHTFTS(tsLinesH5, tsLabelsH5, tsB5, tsR5, tsSH5, tsSL5, tsSHT5, tsSLT5, newSrcH5, tf5, maxSweeps)
+
+
+// =============================================================================
+// 13. tCISD — arms from SSMT OR Turtle Soup, gated by HTF alignment + trend,
+//     reference search unchanged, but the CONFIRMATION LINE ANCHORS AT THE
+//     REFERENCE CANDLE (not the confirmation bar) with a fixed 3-bar
+//     extension, and both arming AND confirmation follow the Trend Engine.
+// =============================================================================
+
+string G_TCISD = "tCISD Settings"
+
+bool  showTCISD          = input.bool(true, "Show tCISD", group=G_TCISD)
+int   tcisdSearchBars    = input.int(20, "Reference Candle Search", minval=1, maxval=100, group=G_TCISD)
+int   tcisdExtension     = input.int(3, "Line Extension Past Reference (bars)", minval=1, maxval=50, group=G_TCISD)
+int   tcisdValidityBars  = input.int(50, "Setup Validity Bars", minval=1, maxval=500, group=G_TCISD)
+bool  tcisdRequireTrend  = input.bool(true, "Strict Trend Direction (Trend Engine)", group=G_TCISD)
+bool  tcisdFromTurtleSoup = input.bool(true, "Also Arm from Current-TF Turtle Soup", group=G_TCISD)
+color bullishTCISDColor  = input.color(color.lime, "Bullish tCISD", group=G_TCISD)
+color bearishTCISDColor  = input.color(color.red, "Bearish tCISD", group=G_TCISD)
+
+tcisdBodyHigh(int offset) => math.max(open[offset], close[offset])
+tcisdBodyLow(int offset)  => math.min(open[offset], close[offset])
+
+f_findBullReference(int back) =>
+    float refLevel = na
+    int refBar = na
+    for i = 0 to tcisdSearchBars - 1
+        int idx = back + i
+        if idx >= 0 and idx <= 5000
+            bool isBearish = close[idx] < open[idx]
+            if isBearish
+                refLevel := tcisdBodyHigh(idx)
+                refBar := bar_index - idx
+                break
+    [refLevel, refBar]
+
+f_findBearReference(int back) =>
+    float refLevel = na
+    int refBar = na
+    for i = 0 to tcisdSearchBars - 1
+        int idx = back + i
+        if idx >= 0 and idx <= 5000
+            bool isBullish = close[idx] > open[idx]
+            if isBullish
+                refLevel := tcisdBodyLow(idx)
+                refBar := bar_index - idx
+                break
+    [refLevel, refBar]
+
+var int   pendingDirection = 0     // 1 = bullish setup pending, -1 = bearish, 0 = none
+var float pendingLevel     = na
+var int   pendingReference = na
+var int   pendingArmBar    = na
+
+bool bullArmTrigger = showTCISD and bullAlignmentOK and (bullishSSMTEvent or (tcisdFromTurtleSoup and tsBullCurEvent))
+bool bearArmTrigger = showTCISD and bearAlignmentOK and (bearishSSMTEvent or (tcisdFromTurtleSoup and tsBearCurEvent))
+
+// ---- Arm-evidence marker — always drawn at the exact bar tCISD arms,
+//      tagged with what armed it. This exists ONLY so the evidence can never
+//      disappear: GXV's own SMT-line cleanup (default "All") can legitimately
+//      DELETE the very SMT line that fed bullishSSMTEvent/bearishSSMTEvent
+//      this bar, if a higher-rank event overlaps the same space one bar
+//      later — that's by design in GXV's rendering, not a bug, but it made
+//      tCISD look unpaired. This marker is independent of that pipeline and
+//      cannot be cleaned up by it. It changes nothing about when/why tCISD
+//      arms — same two booleans, same gating, just an always-visible receipt.
+var array<label> tcisdArmEvidence = array.new_label()
+int    tcisdMaxArmEvidence = 100
+color  tcisdArmEvidenceBullColor = input.color(color.aqua,   "Arm-Evidence Label Color (Bull)", group=G_TCISD)
+color  tcisdArmEvidenceBearColor = input.color(color.orange, "Arm-Evidence Label Color (Bear)", group=G_TCISD)
+
+if bullArmTrigger
+    string armSrcBull = bullishSSMTEvent ? ("SSMT " + bullSsmtRankTag) : "TS"
+    lblArmBull = label.new(bar_index, low, armSrcBull, style=label.style_label_up, color=color.new(tcisdArmEvidenceBullColor, 100), textcolor=tcisdArmEvidenceBullColor, size=size.tiny)
+    array.push(tcisdArmEvidence, lblArmBull)
+    while array.size(tcisdArmEvidence) > tcisdMaxArmEvidence
+        label.delete(array.shift(tcisdArmEvidence))
+
+if bearArmTrigger
+    string armSrcBear = bearishSSMTEvent ? ("SSMT " + bearSsmtRankTag) : "TS"
+    lblArmBear = label.new(bar_index, high, armSrcBear, style=label.style_label_down, color=color.new(tcisdArmEvidenceBearColor, 100), textcolor=tcisdArmEvidenceBearColor, size=size.tiny)
+    array.push(tcisdArmEvidence, lblArmBear)
+    while array.size(tcisdArmEvidence) > tcisdMaxArmEvidence
+        label.delete(array.shift(tcisdArmEvidence))
+
+if bullArmTrigger
+    bool trendOK = not tcisdRequireTrend or bullishTrend
+    if trendOK
+        [refLevel, refBar] = f_findBullReference(ssmtLength)
+        if not na(refLevel) and not na(refBar)
+            pendingDirection := 1
+            pendingLevel     := refLevel
+            pendingReference := refBar
+            pendingArmBar    := bar_index
+
+if bearArmTrigger
+    bool trendOKb = not tcisdRequireTrend or bearishTrend
+    if trendOKb
+        [refLevelB, refBarB] = f_findBearReference(ssmtLength)
+        if not na(refLevelB) and not na(refBarB)
+            pendingDirection := -1
+            pendingLevel     := refLevelB
+            pendingReference := refBarB
+            pendingArmBar    := bar_index
+
+// ---- Expiry ----
+bool pendingExpired = not na(pendingArmBar) and bar_index - pendingArmBar > tcisdValidityBars
+if pendingExpired
+    pendingDirection := 0
+    pendingLevel     := na
+    pendingReference := na
+    pendingArmBar    := na
+
+// ---- Trend-flip cancellation (this is what makes tCISD "follow the Trend Engine") ----
+if pendingDirection == 1 and tcisdRequireTrend and not bullishTrend
+    pendingDirection := 0
+    pendingLevel     := na
+    pendingReference := na
+    pendingArmBar    := na
+
+if pendingDirection == -1 and tcisdRequireTrend and not bearishTrend
+    pendingDirection := 0
+    pendingLevel     := na
+    pendingReference := na
+    pendingArmBar    := na
+
+bool bullTCISD = pendingDirection == 1 and not na(pendingLevel) and bar_index > pendingArmBar and close > pendingLevel and (not tcisdRequireTrend or bullishTrend)
+bool bearTCISD = pendingDirection == -1 and not na(pendingLevel) and bar_index > pendingArmBar and close < pendingLevel and (not tcisdRequireTrend or bearishTrend)
+
+if bullTCISD
+    line.new(pendingReference, pendingLevel, pendingReference + tcisdExtension, pendingLevel, color=bullishTCISDColor, width=1)
+    label.new(pendingReference + tcisdExtension, pendingLevel, "tCISD +", color=color.new(color.gray, 100), textcolor=bullishTCISDColor, style=label.style_label_left, size=size.small)
+    pendingDirection := 0
+    pendingLevel     := na
+    pendingReference := na
+    pendingArmBar    := na
+
+if bearTCISD
+    line.new(pendingReference, pendingLevel, pendingReference + tcisdExtension, pendingLevel, color=bearishTCISDColor, width=1)
+    label.new(pendingReference + tcisdExtension, pendingLevel, "tCISD -", color=color.new(color.gray, 100), textcolor=bearishTCISDColor, style=label.style_label_left, size=size.small)
+    pendingDirection := 0
+    pendingLevel     := na
+    pendingReference := na
+    pendingArmBar    := na
+
+
+// =============================================================================
+// 14. DASHBOARD — fractal Time + True-Open row (v3-style) PLUS the v2-style
+//     QT cycle name / quarter number row, on the SAME table.
+// =============================================================================
+
+string G_DASH = "Dashboard"
+bool showDash = input.bool(true, "Show Dashboard", group=G_DASH)
+
+f_arrow(float lvl) =>
+    na(lvl) ? "-" : close > lvl ? "above" : close < lvl ? "below" : "="
+
+var table dashTable = table.new(position.top_right, 5, 3, border_width=1)
+
+if barstate.islast and showDash
+    // Row 0 — v2-style QT cycle / quarter / trend labels
+    table.cell(dashTable, 0, 0, "SxM Blitz++", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(dashTable, 1, 0, cycleName, text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(dashTable, 2, 0, "Q" + str.tostring(qtQuarterNum), text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(dashTable, 3, 0, "Trend", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small)
+    table.cell(dashTable, 4, 0, bullishTrend ? "BULL" : bearishTrend ? "BEAR" : "NEUTRAL", text_color=bullishTrend ? color.lime : bearishTrend ? color.red : color.gray, bgcolor=color.new(color.black, 0), text_size=size.small)
+
+    // Row 1 — fractal Time (v3-style)
+    table.cell(dashTable, 0, 1, sessAbbrev + str.tostring(subQNum), text_color=color.silver, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+    table.cell(dashTable, 1, 1, dayName3, text_color=color.silver, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+    table.cell(dashTable, 2, 1, "W" + str.tostring(weekOfMonth), text_color=color.silver, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+    table.cell(dashTable, 3, 1, "M" + str.tostring(monthOfQuarter), text_color=color.silver, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+    table.cell(dashTable, 4, 1, "QT" + str.tostring(quarterOfYear), text_color=color.silver, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+
+    // Row 2 — True Opens (Day / Week / Month / Quarter / Year), price vs. open
+    table.cell(dashTable, 0, 2, f_arrow(dayTrueOpen), text_color=color.orange, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+    table.cell(dashTable, 1, 2, f_arrow(weekTrueOpen), text_color=color.orange, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+    table.cell(dashTable, 2, 2, f_arrow(monthTrueOpen), text_color=color.orange, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+    table.cell(dashTable, 3, 2, f_arrow(quarterTrueOpen), text_color=color.orange, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+    table.cell(dashTable, 4, 2, f_arrow(yearTrueOpen), text_color=color.orange, bgcolor=color.new(color.black, 0), text_size=size.tiny)
+
+
+// =============================================================================
+// 15. ALERTS (unchanged — six conditions, all fire at confirmation)
+// =============================================================================
+
+alertcondition(bullishSSMTEvent, "Bullish SSMT", "Bullish SSMT detected.")
+alertcondition(bearishSSMTEvent, "Bearish SSMT", "Bearish SSMT detected.")
+alertcondition(htfBullSSMT, "HTF Bullish SSMT", "Higher timeframe bullish SSMT detected.")
+alertcondition(htfBearSSMT, "HTF Bearish SSMT", "Higher timeframe bearish SSMT detected.")
+alertcondition(bullTCISD, "Bullish tCISD", "Bullish tCISD confirmed.")
+alertcondition(bearTCISD, "Bearish tCISD", "Bearish tCISD confirmed.")
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+
+type TFColors
+    color bull_body
+    color bear_body
+    color bull_border
+    color bear_border
+    color bull_wick
+    color bear_wick
+
+string g_layout = "Layout  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+i_offset  = input.int(10, 'Padding from last candle', minval=1, maxval=50, group=g_layout)
+i_buffer  = input.int(1,  'Space between candles',    minval=1, maxval=4,  group=g_layout)
+i_htfgap  = input.int(5,  'Gap between timeframes',   minval=1, maxval=20, group=g_layout)
+i_width   = input.int(1,  'Candle width',             minval=1, maxval=6,  group=g_layout) * 2
+i_maxshow = input.int(4,  'Candles to show (each TF)',minval=1, maxval=5,  group=g_layout)
+
+string g_tf = "Timeframes  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+i_show_90m = input.bool(true, 'Show 90 Min candles', group=g_tf)
+i_show_6h  = input.bool(true, 'Show 6 Hour candles',  group=g_tf)
+i_show_1d  = input.bool(true, 'Show Daily candles',  group=g_tf)
+
+string g_psp = "PSP Settings ↔️ ━━━━━━━━━━━━━━━━━━━━━"
+i_psp_show      = input.bool(true, "Enable PSP Correlation Engine", group=g_psp)
+i_psp_mode      = input.string("Auto (Ronin)", "Correlation Mode", options=["Auto (Ronin)", "Manual"], group=g_psp)
+i_psp_left      = input.int(1, "Pivot Left Bars", minval=1, group=g_psp)
+i_psp_right     = input.int(1, "Pivot Right Bars", minval=1, group=g_psp)
+i_psp_bull_col  = input.color(color.new(#00ff62, 60), "Bullish PSP Color (Sweep Low)", group=g_psp)
+i_psp_bear_col  = input.color(color.new(#ff002b, 60), "Bearish PSP Color (Sweep High)", group=g_psp)
+i_psp_t2        = input.symbol("", "Manual Pair 2", group=g_psp)
+i_psp_t3        = input.symbol("TVC:DXY", "Manual Pair 3", group=g_psp)
+i_psp_inv3      = input.bool(true, "Invert Pair 3? (e.g. DXY)", group=g_psp)
+
+string g_trace = "Trace Lines ──── ━━━━━━━━━━━━━━━━━━━━━"
+i_trace_tf    = input.string("All", "Apply Trace To", options=["All", "90M", "6H", "1d", "None"], group=g_trace)
+i_trace_o     = input.bool(false, "Show Open", inline="to", group=g_trace)
+i_trace_o_col = input.color(color.new(#000000, 0), "", inline="to", group=g_trace)
+i_trace_o_sty = input.string("····", "", options=["⎯⎯⎯", "----", "····"], inline="to", group=g_trace)
+
+i_trace_c     = input.bool(false, "Show Close", inline="tc", group=g_trace)
+i_trace_c_col = input.color(color.new(color.gray, 50), "", inline="tc", group=g_trace)
+i_trace_c_sty = input.string("····", "", options=["⎯⎯⎯", "----", "····"], inline="tc", group=g_trace)
+
+i_trace_h     = input.bool(false, "Show High", inline="th", group=g_trace)
+i_trace_h_col = input.color(color.new(color.gray, 50), "", inline="th", group=g_trace)
+i_trace_h_sty = input.string("····", "", options=["⎯⎯⎯", "----", "····"], inline="th", group=g_trace)
+
+i_trace_l     = input.bool(false, "Show Low", inline="tl", group=g_trace)
+i_trace_l_col = input.color(color.new(color.gray, 50), "", inline="tl", group=g_trace)
+i_trace_l_sty = input.string("····", "", options=["⎯⎯⎯", "----", "····"], inline="tl", group=g_trace)
+
+string g_90m = "90 Min Colors  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+i_90m_bull_body   = input.color(color.new(#dbdbdb, 100), 'Bull Body  ', inline='90m_body',   group=g_90m)
+i_90m_bear_body   = input.color(color.new(#000000, 10), 'Bear Body',   inline='90m_body',   group=g_90m)
+i_90m_bull_border = input.color(color.new(#000000, 10), 'Bull Border', inline='90m_border', group=g_90m)
+i_90m_bear_border = input.color(color.new(#000000, 10), 'Bear Border', inline='90m_border', group=g_90m)
+i_90m_bull_wick   = input.color(color.new(#000000, 10), 'Bull Wick  ', inline='90m_wick',   group=g_90m)
+i_90m_bear_wick   = input.color(color.new(#000000, 10), 'Bear Wick',   inline='90m_wick',   group=g_90m)
+
+string g_6h = "6 Hour Colors  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+i_6h_bull_body   = input.color(color.new(#dbdbdb, 100), 'Bull Body  ', inline='6h_body',   group=g_6h)
+i_6h_bear_body   = input.color(color.new(#000000, 10), 'Bear Body',   inline='6h_body',   group=g_6h)
+i_6h_bull_border = input.color(color.new(#010201, 10), 'Bull Border', inline='6h_border', group=g_6h)
+i_6h_bear_border = input.color(color.new(#000000, 10), 'Bear Border', inline='6h_border', group=g_6h)
+i_6h_bull_wick   = input.color(color.new(#000000, 10), 'Bull Wick  ', inline='6h_wick',   group=g_6h)
+i_6h_bear_wick   = input.color(color.new(#000000, 10), 'Bear Wick',   inline='6h_wick',   group=g_6h)
+
+string g_1d = "Daily Colors  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+i_1d_bull_body   = input.color(color.new(#dbdbdb, 100), 'Bull Body  ', inline='1d_body',   group=g_1d)
+i_1d_bear_body   = input.color(color.new(#000000, 10), 'Bear Body',   inline='1d_body',   group=g_1d)
+i_1d_bull_border = input.color(color.new(#000000, 10), 'Bull Border', inline='1d_border', group=g_1d)
+i_1d_bear_border = input.color(color.new(#000000, 10), 'Bear Border', inline='1d_border', group=g_1d)
+i_1d_bull_wick   = input.color(color.new(#000000, 10), 'Bull Wick  ', inline='1d_wick',   group=g_1d)
+i_1d_bear_wick   = input.color(color.new(#000000, 10), 'Bear Wick',   inline='1d_wick',   group=g_1d)
+
+string g_fvg = "Fair Value Gap & Sweeps  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+i_fvg_show    = input.bool(true, 'Show Fair Value Gap',    group=g_fvg)
+i_fvg_color   = input.color(color.new(#807d7d, 80), 'FVG Color',           group=g_fvg)
+i_sweep_show  = input.bool(true, 'Show Sweep Lines',       group=g_fvg)
+i_sweep_color = input.color(color.new(#000000, 0),  'Sweep Line Color',    group=g_fvg)
+i_mid_show    = input.bool(true, 'Show Midpoint Lines',    group=g_fvg)
+i_mid_color   = input.color(color.new(#c50404, 0), 'Midpoint Line Color', group=g_fvg)
+
+string g_lbl = "Labels  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+i_show_label  = input.bool(true,          'Show TF label',       group=g_lbl)
+i_label_color = input.color(#000000,      'Label color',         group=g_lbl)
+i_label_size  = input.string(size.small, 'Label size', options=[size.tiny, size.small, size.normal, size.large, size.huge], group=g_lbl)
+i_show_timer  = input.bool(true,          'Show time remaining', group=g_lbl)
+i_show_time   = input.bool(false,          'Show candle open time', group=g_lbl)
+i_time_color  = input.color(#000000,      'Open time color',     group=g_lbl)
+
+color transparent = #ffffff00
+
+string g_sess = "Session Alignment 🕒 ━━━━━━━━━━━━━━━━━"
+i_sess_mode = input.string("Auto", "Alignment Mode", options=["Auto", "Manual"], group=g_sess)
+i_daily_hr  = input.int(17, "Manual Open Hour (EST)", minval=0, maxval=23, group=g_sess, tooltip="Only used if Mode is Manual")
+i_daily_min = input.int(0,  "Manual Open Minute", minval=0, maxval=59, group=g_sess)
+
+// ══════════════════════════════════════════════════════════════
+//  RONIN CORRELATION ENGINE
+// ══════════════════════════════════════════════════════════════
+f_get_ticker(string simple_name) => 
+    if simple_name == "DXY"
+        "TVC:DXY"
+    else if simple_name == "US10Y"
+        "TVC:US10Y"
+    else
+        syminfo.prefix + ":" + simple_name
+
+f_get_ronin_correlation() =>
+    string t2 = ""
+    string t3 = ""
+    string t4 = ""
+    bool inv2 = false
+    bool inv3 = false
+    bool inv4 = false
+    
+    string check_sym = syminfo.root != "" ? syminfo.root : syminfo.ticker
+    
+    switch check_sym
+        "XAUUSD" => 
+            t2 := f_get_ticker("XAGUSD"), inv2 := false
+            t3 := f_get_ticker("XAUEUR"), inv3 := false
+            t4 := f_get_ticker("XAUGBP"), inv4 := false
+        "XAUEUR" => 
+            t2 := f_get_ticker("XAUUSD"), inv2 := false
+            t3 := f_get_ticker("XAUGBP"), inv3 := false
+        "XAUGBP" => 
+            t2 := f_get_ticker("XAUUSD"), inv2 := false
+            t3 := f_get_ticker("XAUEUR"), inv3 := false
+        "XAGUSD" => 
+            t2 := f_get_ticker("XAUUSD"), inv2 := false
+            t3 := f_get_ticker("XAUEUR"), inv3 := false
+        "RB" => 
+            t2 := "HO1!", inv2 := false
+            t3 := "CL1!", inv3 := false
+        "HO" => 
+            t2 := "RB1!", inv2 := false
+            t3 := "CL1!", inv3 := false
+        "CL" => 
+            t2 := "HO1!", inv2 := false
+            t3 := "RB1!", inv3 := false
+        "MNQ" => 
+            t2 := "MES1!", inv2 := false
+            t3 := "MYM1!", inv3 := false
+        "MES" => 
+            t2 := "MNQ1!", inv2 := false
+            t3 := "MYM1!", inv3 := false
+        "MYM" => 
+            t2 := "MES1!", inv2 := false
+            t3 := "MNQ1!", inv3 := false
+        "NQ" => 
+            t2 := "ES1!", inv2 := false
+            t3 := "YM1!", inv3 := false
+        "ES" => 
+            t2 := "NQ1!", inv2 := false
+            t3 := "YM1!", inv3 := false
+        "YM" => 
+            t2 := "ES1!", inv2 := false
+            t3 := "NQ1!", inv3 := false
+        "GC" =>
+            t2 := "SI1!", inv2 := false
+            t3 := "NQ1!", inv3 := false
+        "NASDAQ" => 
+            t2 := "PEPPERSTONE:US500", inv2 := false
+            t3 := "PEPPERSTONE:US30",  inv3 := false
+        "NDAQ100" => 
+            t2 := "PEPPERSTONE:US500", inv2 := false
+            t3 := "PEPPERSTONE:US30",  inv3 := false
+        "NAS100" => 
+            t2 := "PEPPERSTONE:US500", inv2 := false
+            t3 := "PEPPERSTONE:US30",  inv3 := false
+        "SPX500" => 
+            t2 := "PEPPERSTONE:NAS100", inv2 := false
+            t3 := "PEPPERSTONE:US30",   inv3 := false
+        "US500" => 
+            t2 := "PEPPERSTONE:NAS100", inv2 := false
+            t3 := "PEPPERSTONE:US30",   inv3 := false
+        "US30" => 
+            t2 := "PEPPERSTONE:NAS100", inv2 := false
+            t3 := "PEPPERSTONE:US500",  inv3 := false
+        "DJI" => 
+            t2 := "PEPPERSTONE:NAS100", inv2 := false
+            t3 := "PEPPERSTONE:US500",  inv3 := false
+        "WALLSTREET" => 
+            t2 := "PEPPERSTONE:NAS100", inv2 := false
+            t3 := "PEPPERSTONE:US500",  inv3 := false
+        "EURUSD" => 
+            t2 := f_get_ticker("GBPUSD"), inv2 := false
+            t3 := "TVC:DXY",              inv3 := true 
+        "GBPUSD" => 
+            t2 := f_get_ticker("EURUSD"), inv2 := false
+            t3 := "TVC:DXY",              inv3 := true 
+        "AUDUSD" => 
+            t2 := f_get_ticker("NZDUSD"), inv2 := false
+            t3 := "TVC:DXY",              inv3 := true
+        "NZDUSD" => 
+            t2 := f_get_ticker("AUDUSD"), inv2 := false
+            t3 := "TVC:DXY",              inv3 := true
+        "USDJPY" => 
+            t2 := "TVC:DXY",              inv2 := false
+        "USDCAD" => 
+            t2 := "TVC:DXY",              inv2 := false
+        "USDCHF" => 
+            t2 := "TVC:DXY",              inv2 := false
+        "EURJPY" => 
+            t2 := f_get_ticker("GBPJPY"), inv2 := false
+        "GBPJPY" => 
+            t2 := f_get_ticker("EURJPY"), inv2 := false
+        "AUDJPY" => 
+            t2 := f_get_ticker("NZDJPY"), inv2 := false
+        "NZDJPY" => 
+            t2 := f_get_ticker("AUDJPY"), inv2 := false
+        "EURAUD" => 
+            t2 := f_get_ticker("GBPAUD"), inv2 := false
+        "GBPAUD" => 
+            t2 := f_get_ticker("EURAUD"), inv2 := false
+        "EURNZD" => 
+            t2 := f_get_ticker("GBPNZD"), inv2 := false
+        "GBPNZD" => 
+            t2 := f_get_ticker("EURNZD"), inv2 := false
+        "EURCAD" => 
+            t2 := f_get_ticker("GBPCAD"), inv2 := false
+        "GBPCAD" => 
+            t2 := f_get_ticker("EURCAD"), inv2 := false
+        "AUDCAD" => 
+            t2 := f_get_ticker("NZDCAD"), inv2 := false
+        "NZDCAD" => 
+            t2 := f_get_ticker("AUDCAD"), inv2 := false
+        "BTCUSDT" =>
+            t2 := f_get_ticker("ETHUSDT"), inv2 := false
+        "ETHUSDT" =>
+            t2 := f_get_ticker("BTCUSDT"), inv2 := false
+            
+    [t2, t3, t4, inv2, inv3, inv4]
+
+var string ticker1 = syminfo.tickerid 
+var string ticker2 = ""
+var string ticker3 = ""
+var string ticker4 = ""
+var bool   inv2    = false
+var bool   inv3    = false
+var bool   inv4    = false
+
+if barstate.isfirst
+    if i_psp_mode == "Auto (Ronin)"
+        [t2, t3, t4, i2, i3, i4] = f_get_ronin_correlation()
+        ticker2 := t2
+        ticker3 := t3
+        ticker4 := t4
+        inv2 := i2
+        inv3 := i3
+        inv4 := i4
+    else
+        ticker2 := i_psp_t2
+        ticker3 := i_psp_t3
+        inv3    := i_psp_inv3
+
+// ══════════════════════════════════════════════════════════════
+//  AUTO-DETECT LOGIC (BROKER AGNOSTIC)
+// ══════════════════════════════════════════════════════════════
+int current_d_time = time("D")
+int auto_hr  = not na(current_d_time) ? hour(current_d_time, "America/New_York") : 17
+int auto_min = not na(current_d_time) ? minute(current_d_time, "America/New_York") : 0
+
+int eff_hr  = i_sess_mode == "Auto" ? auto_hr : i_daily_hr
+int eff_min = i_sess_mode == "Auto" ? auto_min : i_daily_min
+
+// ══════════════════════════════════════════════════════════════
+//  DYNAMIC LOWER TIMEFRAME ARRAY AGGREGATOR
+// ══════════════════════════════════════════════════════════════
+string auto_base_tf = timeframe.in_seconds() < 900 ? timeframe.period : "15"
+
+// Base Ticker Arrays
+var array<float> g_o15 = array.new<float>()
+var array<float> g_h15 = array.new<float>()
+var array<float> g_l15 = array.new<float>()
+var array<float> g_c15 = array.new<float>()
+var array<int>   g_t15 = array.new<int>()
+
+// Correlated Ticker Arrays (Only O/C needed for PSP)
+var array<float> g_o2 = array.new<float>()
+var array<float> g_c2 = array.new<float>()
+var array<int>   g_t2 = array.new<int>()
+
+var array<float> g_o3 = array.new<float>()
+var array<float> g_c3 = array.new<float>()
+var array<int>   g_t3 = array.new<int>()
+
+var array<float> g_o4 = array.new<float>()
+var array<float> g_c4 = array.new<float>()
+var array<int>   g_t4 = array.new<int>()
+
+[o15, h15, l15, c15, t15] = request.security_lower_tf(syminfo.tickerid, auto_base_tf, [open, high, low, close, time])
+[o15_2, c15_2, t15_2]     = request.security_lower_tf(ticker2 != "" ? ticker2 : syminfo.tickerid, auto_base_tf, [open, close, time], ignore_invalid_symbol=true)
+[o15_3, c15_3, t15_3]     = request.security_lower_tf(ticker3 != "" ? ticker3 : syminfo.tickerid, auto_base_tf, [open, close, time], ignore_invalid_symbol=true)
+[o15_4, c15_4, t15_4]     = request.security_lower_tf(ticker4 != "" ? ticker4 : syminfo.tickerid, auto_base_tf, [open, close, time], ignore_invalid_symbol=true)
+
+f_push_arrays(arr_src, arr_dst) =>
+    if array.size(arr_src) > 0
+        for i = 0 to array.size(arr_src) - 1
+            array.push(arr_dst, array.get(arr_src, i))
+
+f_push_arrays(o15, g_o15), f_push_arrays(h15, g_h15), f_push_arrays(l15, g_l15), f_push_arrays(c15, g_c15), f_push_arrays(t15, g_t15)
+if ticker2 != ""
+    f_push_arrays(o15_2, g_o2), f_push_arrays(c15_2, g_c2), f_push_arrays(t15_2, g_t2)
+if ticker3 != ""
+    f_push_arrays(o15_3, g_o3), f_push_arrays(c15_3, g_c3), f_push_arrays(t15_3, g_t3)
+if ticker4 != ""
+    f_push_arrays(o15_4, g_o4), f_push_arrays(c15_4, g_c4), f_push_arrays(t15_4, g_t4)
+
+f_clip_arrays(arr) =>
+    int max_bars = 5000 
+    if array.size(arr) > max_bars
+        int excess = array.size(arr) - max_bars
+        for i = 1 to excess
+            array.shift(arr)
+
+f_clip_arrays(g_o15), f_clip_arrays(g_h15), f_clip_arrays(g_l15), f_clip_arrays(g_c15), f_clip_arrays(g_t15)
+f_clip_arrays(g_o2), f_clip_arrays(g_c2), f_clip_arrays(g_t2)
+f_clip_arrays(g_o3), f_clip_arrays(g_c3), f_clip_arrays(g_t3)
+f_clip_arrays(g_o4), f_clip_arrays(g_c4), f_clip_arrays(g_t4)
+
+f_get_custom_htf(int target_mins, array<int> arr_t, array<float> arr_o, array<float> arr_h, array<float> arr_l, array<float> arr_c) =>
+    array<float> out_o = array.new<float>()
+    array<float> out_h = array.new<float>()
+    array<float> out_l = array.new<float>()
+    array<float> out_c = array.new<float>()
+    array<int>   out_t = array.new<int>()
+    
+    int sz = array.size(arr_t)
+    if sz > 0
+        int last_htf_open = -1
+        float cur_o = na, float cur_h = na, float cur_l = na, float cur_c = na
+        int cur_t = na
+        
+        for i = sz - 1 to 0
+            int t = array.get(arr_t, i)
+            int h_ny = hour(t, "America/New_York")
+            int m_ny = minute(t, "America/New_York")
+            
+            int elapsed_mins_today = h_ny * 60 + m_ny
+            int anchor_mins_today = eff_hr * 60 + eff_min
+            
+            int shift_mins = elapsed_mins_today - anchor_mins_today
+            if shift_mins < 0
+                shift_mins += 1440
+                
+            int htf_open_time = t - ((shift_mins % target_mins) * 60000)
+            
+            if htf_open_time != last_htf_open
+                if last_htf_open != -1
+                    array.push(out_o, cur_o), array.push(out_h, cur_h), array.push(out_l, cur_l), array.push(out_c, cur_c), array.push(out_t, cur_t)
+                    if array.size(out_o) >= 5
+                        break
+                        
+                last_htf_open := htf_open_time
+                cur_c := array.get(arr_c, i), cur_h := array.get(arr_h, i), cur_l := array.get(arr_l, i), cur_o := array.get(arr_o, i), cur_t := htf_open_time
+            else
+                cur_h := math.max(cur_h, array.get(arr_h, i)), cur_l := math.min(cur_l, array.get(arr_l, i)), cur_o := array.get(arr_o, i)
+                
+        if array.size(out_o) < 5 and last_htf_open != -1
+            array.push(out_o, cur_o), array.push(out_h, cur_h), array.push(out_l, cur_l), array.push(out_c, cur_c), array.push(out_t, cur_t)
+            
+    while array.size(out_o) < 5
+        array.push(out_o, na), array.push(out_h, na), array.push(out_l, na), array.push(out_c, na), array.push(out_t, na)
+        
+    [out_o, out_h, out_l, out_c, out_t]
+
+f_get_custom_htf_oc(int target_mins, array<int> arr_t, array<float> arr_o, array<float> arr_c) =>
+    array<float> out_o = array.new<float>()
+    array<float> out_c = array.new<float>()
+    
+    int sz = array.size(arr_t)
+    if sz > 0
+        int last_htf_open = -1
+        float cur_o = na, float cur_c = na
+        for i = sz - 1 to 0
+            int t = array.get(arr_t, i)
+            int h_ny = hour(t, "America/New_York"), m_ny = minute(t, "America/New_York")
+            int shift_mins = (h_ny * 60 + m_ny) - (eff_hr * 60 + eff_min)
+            if shift_mins < 0
+                shift_mins += 1440
+            int htf_open_time = t - ((shift_mins % target_mins) * 60000)
+
+            if htf_open_time != last_htf_open
+                if last_htf_open != -1
+                    array.push(out_o, cur_o), array.push(out_c, cur_c)
+                    if array.size(out_o) >= 5
+                        break
+                last_htf_open := htf_open_time
+                cur_c := array.get(arr_c, i), cur_o := array.get(arr_o, i)
+            else
+                cur_o := array.get(arr_o, i)
+                
+        if array.size(out_o) < 5 and last_htf_open != -1
+            array.push(out_o, cur_o), array.push(out_c, cur_c)
+            
+    while array.size(out_o) < 5
+        array.push(out_o, na), array.push(out_c, na)
+    [out_o, out_c]
+
+// ══════════════════════════════════════════════════════════════
+//  PSP CALCULATION ENGINE
+// ══════════════════════════════════════════════════════════════
+f_calc_psp(array<float> os, array<float> hs, array<float> ls, array<float> cs, array<float> o2, array<float> c2, array<float> o3, array<float> c3, array<float> o4, array<float> c4) =>
+    array<int> psp = array.new<int>(5, 0)
+    int left = i_psp_left
+    int right = i_psp_right
+
+    for i = right to (4 - left)
+        if na(os.get(i))
+            continue
+
+        bool is_ph = true
+        for j = 1 to left
+            if hs.get(i) <= hs.get(i + j)
+                is_ph := false
+        for j = 1 to right
+            if hs.get(i) <= hs.get(i - j)
+                is_ph := false
+
+        bool is_pl = true
+        for j = 1 to left
+            if ls.get(i) >= ls.get(i + j)
+                is_pl := false
+        for j = 1 to right
+            if ls.get(i) >= ls.get(i - j)
+                is_pl := false
+
+        if is_ph or is_pl
+            bool b1 = cs.get(i) >= os.get(i)
+            bool crack = false
+
+            if ticker2 != "" and array.size(o2) > i and not na(o2.get(i))
+                bool b2 = (c2.get(i) >= o2.get(i))
+                if inv2
+                    b2 := not b2
+                if b1 != b2
+                    crack := true
+
+            if ticker3 != "" and array.size(o3) > i and not na(o3.get(i))
+                bool b3 = (c3.get(i) >= o3.get(i))
+                if inv3
+                    b3 := not b3
+                if b1 != b3
+                    crack := true
+
+            if ticker4 != "" and array.size(o4) > i and not na(o4.get(i))
+                bool b4 = (c4.get(i) >= o4.get(i))
+                if inv4
+                    b4 := not b4
+                if b1 != b4
+                    crack := true
+
+            if crack
+                if is_ph
+                    psp.set(i, 1) // 1 = psp bear color
+                if is_pl
+                    psp.set(i, 2) // 2 = psp bull color
+    psp
+
+// ══════════════════════════════════════════════════════════════
+//  MAP VARIABLES TO DRAW LOGIC
+// ══════════════════════════════════════════════════════════════
+[o90_arr, h90_arr, l90_arr, c90_arr, t90_arr] = f_get_custom_htf(90, g_t15, g_o15, g_h15, g_l15, g_c15)
+[o90_t2, c90_t2] = f_get_custom_htf_oc(90, g_t2, g_o2, g_c2)
+[o90_t3, c90_t3] = f_get_custom_htf_oc(90, g_t3, g_o3, g_c3)
+[o90_t4, c90_t4] = f_get_custom_htf_oc(90, g_t4, g_o4, g_c4)
+array<int> psp_90 = i_psp_show ? f_calc_psp(o90_arr, h90_arr, l90_arr, c90_arr, o90_t2, c90_t2, o90_t3, c90_t3, o90_t4, c90_t4) : array.new<int>(5, 0)
+
+[o6h_arr, h6h_arr, l6h_arr, c6h_arr, t6h_arr] = f_get_custom_htf(360, g_t15, g_o15, g_h15, g_l15, g_c15)
+[o6h_t2, c6h_t2] = f_get_custom_htf_oc(360, g_t2, g_o2, g_c2)
+[o6h_t3, c6h_t3] = f_get_custom_htf_oc(360, g_t3, g_o3, g_c3)
+[o6h_t4, c6h_t4] = f_get_custom_htf_oc(360, g_t4, g_o4, g_c4)
+array<int> psp_6h = i_psp_show ? f_calc_psp(o6h_arr, h6h_arr, l6h_arr, c6h_arr, o6h_t2, c6h_t2, o6h_t3, c6h_t3, o6h_t4, c6h_t4) : array.new<int>(5, 0)
+
+[o1d_arr, h1d_arr, l1d_arr, c1d_arr, t1d_arr] = f_get_custom_htf(1440, g_t15, g_o15, g_h15, g_l15, g_c15)
+[o1d_t2, c1d_t2] = f_get_custom_htf_oc(1440, g_t2, g_o2, g_c2)
+[o1d_t3, c1d_t3] = f_get_custom_htf_oc(1440, g_t3, g_o3, g_c3)
+[o1d_t4, c1d_t4] = f_get_custom_htf_oc(1440, g_t4, g_o4, g_c4)
+array<int> psp_1d = i_psp_show ? f_calc_psp(o1d_arr, h1d_arr, l1d_arr, c1d_arr, o1d_t2, c1d_t2, o1d_t3, c1d_t3, o1d_t4, c1d_t4) : array.new<int>(5, 0)
+
+o90_0 = array.get(o90_arr, 0), h90_0 = array.get(h90_arr, 0), l90_0 = array.get(l90_arr, 0), c90_0 = array.get(c90_arr, 0), t90_0 = array.get(t90_arr, 0)
+o90_1 = array.get(o90_arr, 1), h90_1 = array.get(h90_arr, 1), l90_1 = array.get(l90_arr, 1), c90_1 = array.get(c90_arr, 1), t90_1 = array.get(t90_arr, 1)
+o90_2 = array.get(o90_arr, 2), h90_2 = array.get(h90_arr, 2), l90_2 = array.get(l90_arr, 2), c90_2 = array.get(c90_arr, 2), t90_2 = array.get(t90_arr, 2)
+o90_3 = array.get(o90_arr, 3), h90_3 = array.get(h90_arr, 3), l90_3 = array.get(l90_arr, 3), c90_3 = array.get(c90_arr, 3), t90_3 = array.get(t90_arr, 3)
+o90_4 = array.get(o90_arr, 4), h90_4 = array.get(h90_arr, 4), l90_4 = array.get(l90_arr, 4), c90_4 = array.get(c90_arr, 4), t90_4 = array.get(t90_arr, 4)
+
+o6h_0 = array.get(o6h_arr, 0), h6h_0 = array.get(h6h_arr, 0), l6h_0 = array.get(l6h_arr, 0), c6h_0 = array.get(c6h_arr, 0), t6h_0 = array.get(t6h_arr, 0)
+o6h_1 = array.get(o6h_arr, 1), h6h_1 = array.get(h6h_arr, 1), l6h_1 = array.get(l6h_arr, 1), c6h_1 = array.get(c6h_arr, 1), t6h_1 = array.get(t6h_arr, 1)
+o6h_2 = array.get(o6h_arr, 2), h6h_2 = array.get(h6h_arr, 2), l6h_2 = array.get(l6h_arr, 2), c6h_2 = array.get(c6h_arr, 2), t6h_2 = array.get(t6h_arr, 2)
+o6h_3 = array.get(o6h_arr, 3), h6h_3 = array.get(h6h_arr, 3), l6h_3 = array.get(l6h_arr, 3), c6h_3 = array.get(c6h_arr, 3), t6h_3 = array.get(t6h_arr, 3)
+o6h_4 = array.get(o6h_arr, 4), h6h_4 = array.get(h6h_arr, 4), l6h_4 = array.get(l6h_arr, 4), c6h_4 = array.get(c6h_arr, 4), t6h_4 = array.get(t6h_arr, 4)
+
+o1d_0 = array.get(o1d_arr, 0), h1d_0 = array.get(h1d_arr, 0), l1d_0 = array.get(l1d_arr, 0), c1d_0 = array.get(c1d_arr, 0), t1d_0 = array.get(t1d_arr, 0)
+o1d_1 = array.get(o1d_arr, 1), h1d_1 = array.get(h1d_arr, 1), l1d_1 = array.get(l1d_arr, 1), c1d_1 = array.get(c1d_arr, 1), t1d_1 = array.get(t1d_arr, 1)
+o1d_2 = array.get(o1d_arr, 2), h1d_2 = array.get(h1d_arr, 2), l1d_2 = array.get(l1d_arr, 2), c1d_2 = array.get(c1d_arr, 2), t1d_2 = array.get(t1d_arr, 2)
+o1d_3 = array.get(o1d_arr, 3), h1d_3 = array.get(h1d_arr, 3), l1d_3 = array.get(l1d_arr, 3), c1d_3 = array.get(c1d_arr, 3), t1d_3 = array.get(t1d_arr, 3)
+o1d_4 = array.get(o1d_arr, 4), h1d_4 = array.get(h1d_arr, 4), l1d_4 = array.get(l1d_arr, 4), c1d_4 = array.get(c1d_arr, 4), t1d_4 = array.get(t1d_arr, 4)
+
+// ══════════════════════════════════════════════════════════════
+//  TRACE START INDEX TRACKERS (Prevents xloc error)
+// ══════════════════════════════════════════════════════════════
+var int idx_90m = bar_index
+if t90_0 != t90_0[1]
+    idx_90m := bar_index
+
+var int idx_6h = bar_index
+if t6h_0 != t6h_0[1]
+    idx_6h := bar_index
+
+var int idx_1d = bar_index
+if t1d_0 != t1d_0[1]
+    idx_1d := bar_index
+
+// ══════════════════════════════════════════════════════════════
+//  DRAWING STORAGE & TRACES
+// ══════════════════════════════════════════════════════════════
+var array<box>   g_bodies    = array.new<box>()
+var array<line>  g_wicks_up  = array.new<line>()
+var array<line>  g_wicks_dn  = array.new<line>()
+var array<box>   g_fvgs      = array.new<box>()
+var array<line>  g_sweeps    = array.new<line>()
+var array<line>  g_mids      = array.new<line>()
+var array<label> g_timelabels = array.new<label>()
+var array<line>  g_traces    = array.new<line>()
+
+var label g_lbl_90m = na
+var label g_lbl_6h  = na
+var label g_lbl_1d  = na
+
+// ══════════════════════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════════════════════
+isValidHTF(int target_mins) =>
+    timeframe.in_seconds() <= target_mins * 60
+
+calcMidpoint(float h, float l, float o, float c) =>
+    float lh = math.log(h)
+    float ll = math.log(l)
+    float lo = math.log(o)
+    float lc = math.log(c)
+    float uw = lh - math.max(lo, lc)
+    float lw = math.min(lo, lc) - ll
+    float bs = math.abs(lc - lo)
+    float lmid = math.max(uw, lw) > bs ? (uw > lw ? lh - uw / 2 : ll + lw / 2) : (lh + ll) / 2
+    math.exp(lmid)
+
+formatTime(int t) =>
+    str.format_time(t, "HH:mm", "America/New_York")
+
+remainingCustomTime(int openTime, int target_mins) =>
+    if barstate.isrealtime and not na(openTime)
+        int closeTime = openTime + (target_mins * 60000)
+        int rem = math.max(0, int((closeTime - timenow) / 1000))
+        if rem == 0
+            '00:00'
+        else
+            int d = int(rem / 86400)
+            int h = int((rem - d * 86400) / 3600)
+            int m = int((rem - d * 86400 - h * 3600) / 60)
+            int s = int(rem - d * 86400 - h * 3600 - m * 60)
+            string r = str.tostring(s, '00')
+            if m > 0 or h > 0 or d > 0
+                r := str.tostring(m, '00') + ':' + r
+            if h > 0 or d > 0
+                r := str.tostring(h, '00') + ':' + r
+            if d > 0
+                r := str.tostring(d) + 'D ' + r
+            r
+    else
+        'n/a'
+
+get_line_style2(string s) =>
+    s == "----" ? line.style_dashed : s == "····" ? line.style_dotted : line.style_solid
+
+f_draw_traces(int start_idx, float o, float h, float l, float c, int newest_x1, int newest_xm, string tf_name) =>
+    if i_trace_tf == "All" or i_trace_tf == tf_name
+        if i_trace_o
+            g_traces.push(line.new(start_idx, o, newest_x1, o, color=i_trace_o_col, style=get_line_style2(i_trace_o_sty)))
+        if i_trace_c
+            g_traces.push(line.new(start_idx, c, newest_x1, c, color=i_trace_c_col, style=get_line_style2(i_trace_c_sty)))
+        if i_trace_h
+            g_traces.push(line.new(start_idx, h, newest_xm, h, color=i_trace_h_col, style=get_line_style2(i_trace_h_sty)))
+        if i_trace_l
+            g_traces.push(line.new(start_idx, l, newest_xm, l, color=i_trace_l_col, style=get_line_style2(i_trace_l_sty)))
+
+// ══════════════════════════════════════════════════════════════
+//  DELETE ALL
+// ══════════════════════════════════════════════════════════════
+deleteAll() =>
+    int i = 0
+    while i < g_bodies.size()
+        box.delete(g_bodies.get(i)), i += 1
+    g_bodies.clear(), i := 0
+    while i < g_wicks_up.size()
+        line.delete(g_wicks_up.get(i)), i += 1
+    g_wicks_up.clear(), i := 0
+    while i < g_wicks_dn.size()
+        line.delete(g_wicks_dn.get(i)), i += 1
+    g_wicks_dn.clear(), i := 0
+    while i < g_fvgs.size()
+        box.delete(g_fvgs.get(i)), i += 1
+    g_fvgs.clear(), i := 0
+    while i < g_sweeps.size()
+        line.delete(g_sweeps.get(i)), i += 1
+    g_sweeps.clear(), i := 0
+    while i < g_mids.size()
+        line.delete(g_mids.get(i)), i += 1
+    g_mids.clear(), i := 0
+    while i < g_timelabels.size()
+        label.delete(g_timelabels.get(i)), i += 1
+    g_timelabels.clear()
+    while g_traces.size() > 0
+        line.delete(g_traces.pop())
+
+// ══════════════════════════════════════════════════════════════
+//  DRAW CANDLE
+// ══════════════════════════════════════════════════════════════
+drawCandle(float o, float h, float l, float c, int t, int slot, int startOff, TFColors col, int psp_status) =>
+    int x1 = bar_index + startOff + slot * (i_width + i_buffer)
+    int x2 = x1 + i_width
+    int xm = x1 + i_width / 2
+    bool bull = c >= o
+    
+    color b_col = bull ? col.bull_body : col.bear_body
+    if psp_status == 1
+        b_col := i_psp_bear_col
+    else if psp_status == 2
+        b_col := i_psp_bull_col
+        
+    box bd = box.new(x1, math.max(o,c), x2, math.min(o,c),
+             bull ? col.bull_border : col.bear_border, 1,
+             bgcolor = b_col)
+    line wu = line.new(xm, h, xm, math.max(o,c), color = bull ? col.bull_wick : col.bear_wick)
+    line wd = line.new(xm, math.min(o,c), xm, l,  color = bull ? col.bull_wick : col.bear_wick)
+    g_bodies.push(bd)
+    g_wicks_up.push(wu)
+    g_wicks_dn.push(wd)
+    
+    if i_show_time and not na(t)
+        label tl = label.new(xm, l, formatTime(t),
+                     color=transparent, textcolor=i_time_color,
+                     style=label.style_label_up, size=size.normal,
+                     text_font_family=font.family_monospace)
+        g_timelabels.push(tl)
+    [x1, x2, h, l]
+
+// ══════════════════════════════════════════════════════════════
+//  DRAW BLOCK
+// ══════════════════════════════════════════════════════════════
+drawBlock(
+     float o0, float h0, float l0, float c0, int t0,
+     float o1, float h1, float l1, float c1, int t1,
+     float o2, float h2, float l2, float c2, int t2,
+     float o3, float h3, float l3, float c3, int t3,
+     float o4, float h4, float l4, float c4, int t4,
+     array<int> psp_arr, int startOff, int n, TFColors col) =>
+
+    os = array.from(o4, o3, o2, o1, o0)
+    hs = array.from(h4, h3, h2, h1, h0)
+    ls = array.from(l4, l3, l2, l1, l0)
+    cs = array.from(c4, c3, c2, c1, c0)
+    ts = array.from(t4, t3, t2, t1, t0)
+
+    int si = 5 - n
+
+    xs1  = array.new<int>()
+    xs2  = array.new<int>()
+    chs  = array.new<float>()
+    cls  = array.new<float>()
+    cos  = array.new<float>()
+    ccs  = array.new<float>()
+    float blockHigh = 0.0
+
+    int slot = 0
+    while slot < n
+        int idx = si + slot
+        float co = os.get(idx)
+        float ch = hs.get(idx)
+        float cl = ls.get(idx)
+        float cc = cs.get(idx)
+        int   ct = ts.get(idx)
+        
+        int p_idx = 4 - idx // Match array indexing for PSP
+        int psp_status = psp_arr.get(p_idx)
+        
+        if not na(co)
+            [x1, x2, cvh, cvl] = drawCandle(co, ch, cl, cc, ct, slot, startOff, col, psp_status)
+            xs1.push(x1)
+            xs2.push(x2)
+            chs.push(ch)
+            cls.push(cl)
+            cos.push(co)
+            ccs.push(cc)
+            if ch > blockHigh
+                blockHigh := ch
+        slot += 1
+
+    int drawn = xs1.size()
+
+    if i_mid_show and drawn >= 2
+        int i = 0
+        while i < drawn - 1
+            float mid = calcMidpoint(chs.get(i), cls.get(i), cos.get(i), ccs.get(i))
+            int mx1 = xs1.get(i)   + i_width / 2
+            int mx2 = xs1.get(i+1) + i_width / 2
+            g_mids.push(line.new(mx1, mid, mx2, mid, color=i_mid_color, style=line.style_dotted, width=1))
+            i += 1
+
+    if i_sweep_show and drawn >= 2
+        int i = 0
+        while i < drawn - 1
+            float ph = chs.get(i)
+            float pl = cls.get(i)
+            float nh = chs.get(i+1)
+            float nl = cls.get(i+1)
+            float nc = ccs.get(i+1)
+            int sx1 = xs1.get(i)   + i_width / 2
+            int sx2 = xs2.get(i+1)
+            if nh > ph and nc < ph
+                g_sweeps.push(line.new(sx1, ph, sx2, ph, color=i_sweep_color, width=1))
+            if nl < pl and nc > pl
+                g_sweeps.push(line.new(sx1, pl, sx2, pl, color=i_sweep_color, width=1))
+            i += 1
+
+    if i_fvg_show and drawn >= 3
+        int i = 0
+        while i < drawn - 2
+            float h1f = chs.get(i)
+            float l1f = cls.get(i)
+            float h3f = chs.get(i+2)
+            float l3f = cls.get(i+2)
+            int fx1 = xs1.get(i)
+            int fx2 = xs2.get(i+2)
+            if l1f > h3f
+                g_fvgs.push(box.new(fx1, l1f, fx2, h3f, bgcolor=i_fvg_color, border_color=transparent))
+            if h1f < l3f
+                g_fvgs.push(box.new(fx1, l3f, fx2, h1f, bgcolor=i_fvg_color, border_color=transparent))
+            i += 1
+
+    int totalW  = n * i_width + math.max(0, n-1) * i_buffer
+    int centerX = bar_index + startOff + totalW / 2
+    [centerX, blockHigh, startOff + totalW + i_htfgap]
+
+// ══════════════════════════════════════════════════════════════
+//  COLOR OBJECTS
+// ══════════════════════════════════════════════════════════════
+TFColors col_90m = TFColors.new(i_90m_bull_body,i_90m_bear_body,i_90m_bull_border,i_90m_bear_border,i_90m_bull_wick,i_90m_bear_wick)
+TFColors col_6h  = TFColors.new(i_6h_bull_body, i_6h_bear_body, i_6h_bull_border, i_6h_bear_border, i_6h_bull_wick, i_6h_bear_wick)
+TFColors col_1d  = TFColors.new(i_1d_bull_body, i_1d_bear_body, i_1d_bull_border, i_1d_bear_border, i_1d_bull_wick, i_1d_bear_wick)
+
+// ══════════════════════════════════════════════════════════════
+//  MAIN
+// ══════════════════════════════════════════════════════════════
+if barstate.islast
+    deleteAll()
+    int n   = math.min(i_maxshow, 5)
+    int off = i_offset
+
+    if i_show_90m and isValidHTF(90)
+        [cx, top, nextOff] = drawBlock(
+             o90_0,h90_0,l90_0,c90_0,t90_0,
+             o90_1,h90_1,l90_1,c90_1,t90_1,
+             o90_2,h90_2,l90_2,c90_2,t90_2,
+             o90_3,h90_3,l90_3,c90_3,t90_3,
+             o90_4,h90_4,l90_4,c90_4,t90_4,
+             psp_90, off, n, col_90m)
+        
+        int newest_x1_90m = bar_index + off + (n - 1) * (i_width + i_buffer)
+        f_draw_traces(idx_90m, o90_0, h90_0, l90_0, c90_0, newest_x1_90m, newest_x1_90m + i_width / 2, "90M")
+
+        if i_show_label
+            string txt = 'TF: 90M' + (i_show_timer ? '\n[' + remainingCustomTime(t90_0, 90) + ']' : '')
+            if na(g_lbl_90m)
+                g_lbl_90m := label.new(cx, top, txt, color=transparent, textcolor=i_label_color, style=label.style_label_down, size=i_label_size, text_font_family=font.family_monospace)
+            else
+                label.set_xy(g_lbl_90m, cx, top)
+                label.set_text(g_lbl_90m, txt)
+        off := nextOff
+
+    if i_show_6h and isValidHTF(360)
+        [cx, top, nextOff] = drawBlock(
+             o6h_0,h6h_0,l6h_0,c6h_0,t6h_0,
+             o6h_1,h6h_1,l6h_1,c6h_1,t6h_1,
+             o6h_2,h6h_2,l6h_2,c6h_2,t6h_2,
+             o6h_3,h6h_3,l6h_3,c6h_3,t6h_3,
+             o6h_4,h6h_4,l6h_4,c6h_4,t6h_4,
+             psp_6h, off, n, col_6h)
+             
+        int newest_x1_6h = bar_index + off + (n - 1) * (i_width + i_buffer)
+        f_draw_traces(idx_6h, o6h_0, h6h_0, l6h_0, c6h_0, newest_x1_6h, newest_x1_6h + i_width / 2, "6H")
+
+        if i_show_label
+            string txt = 'TF: 6H' + (i_show_timer ? '\n[' + remainingCustomTime(t6h_0, 360) + ']' : '')
+            if na(g_lbl_6h)
+                g_lbl_6h := label.new(cx, top, txt, color=transparent, textcolor=i_label_color, style=label.style_label_down, size=i_label_size, text_font_family=font.family_monospace)
+            else
+                label.set_xy(g_lbl_6h, cx, top)
+                label.set_text(g_lbl_6h, txt)
+        off := nextOff
+
+    if i_show_1d and isValidHTF(1440)
+        [cx, top, nextOff] = drawBlock(
+             o1d_0,h1d_0,l1d_0,c1d_0,t1d_0,
+             o1d_1,h1d_1,l1d_1,c1d_1,t1d_1,
+             o1d_2,h1d_2,l1d_2,c1d_2,t1d_2,
+             o1d_3,h1d_3,l1d_3,c1d_3,t1d_3,
+             o1d_4,h1d_4,l1d_4,c1d_4,t1d_4,
+             psp_1d, off, n, col_1d)
+             
+        int newest_x1_1d = bar_index + off + (n - 1) * (i_width + i_buffer)
+        f_draw_traces(idx_1d, o1d_0, h1d_0, l1d_0, c1d_0, newest_x1_1d, newest_x1_1d + i_width / 2, "1d")
+
+        if i_show_label
+            string txt = 'TF: 1d' + (i_show_timer ? '\n[' + remainingCustomTime(t1d_0, 1440) + ']' : '')
+            if na(g_lbl_1d)
+                g_lbl_1d := label.new(cx, top, txt, color=transparent, textcolor=i_label_color, style=label.style_label_down, size=i_label_size, text_font_family=font.family_monospace)
+            else
+                label.set_xy(g_lbl_1d, cx, top)
+                label.set_text(g_lbl_1d, txt)
