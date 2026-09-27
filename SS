@@ -1,0 +1,1088 @@
+//@version=6
+indicator(
+     "SMT + Strength Switch",
+     shorttitle = "SMT + SS",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500,
+     dynamic_requests = true)
+
+//══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+//══════════════════════════════════════════════════════════════════════════════
+
+//──────────────────────────────────────────────────────────────────────────────
+// PAIR
+//──────────────────────────────────────────────────────────────────────────────
+
+string G_PAIR = "1. Pair Configuration"
+
+bool autoPair = input.bool(
+     true,
+     "Automatic Pair",
+     group = G_PAIR,
+     tooltip = "Automatically detects common correlated pairs.")
+
+string manualPair = input.symbol(
+     "CME_MINI:ES1!",
+     "Manual Pair",
+     group = G_PAIR)
+
+bool useSecondPair = input.bool(
+     false,
+     "Enable Second Pair",
+     group = G_PAIR)
+
+string secondPair = input.symbol(
+     "CME_MINI:NQ1!",
+     "Second Pair",
+     group = G_PAIR)
+
+bool requireSecondPair = input.bool(
+     false,
+     "Require Second Pair Confluence",
+     group = G_PAIR)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// SWING / SMT
+//──────────────────────────────────────────────────────────────────────────────
+
+string G_SWING = "2. Swing / SMT Detection"
+
+string swingStrength = input.string(
+     "Medium",
+     "Swing Strength",
+     options = ["Low", "Medium", "Strong"],
+     group = G_SWING)
+
+int pivotMatchBars = input.int(
+     6,
+     "Maximum Pivot Match Distance",
+     minval = 1,
+     maxval = 30,
+     group = G_SWING)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// STRENGTH SWITCH
+//──────────────────────────────────────────────────────────────────────────────
+
+string G_SS = "3. Strength Switch"
+
+int ssWindow = input.int(
+     4,
+     "SS Window",
+     minval = 1,
+     maxval = 20,
+     group = G_SS,
+     tooltip = "Number of candles after SMT in which an SS can occur.")
+
+int ssConsecutive = input.int(
+     2,
+     "SS Consecutive Candles",
+     minval = 1,
+     maxval = 5,
+     group = G_SS,
+     tooltip = "Number of consecutive relative-strength candles required.")
+
+string ssMode = input.string(
+     "Relative Close",
+     "SS Confirmation",
+     options = ["Relative Close", "Candle Body"],
+     group = G_SS)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// FILTER
+//──────────────────────────────────────────────────────────────────────────────
+
+string G_FILTER = "4. Filters"
+
+string bias = input.string(
+     "Neutral",
+     "Bias",
+     options = ["Neutral", "Bullish", "Bearish"],
+     group = G_FILTER)
+
+bool onlySS = input.bool(
+     false,
+     "Show Only SMT With SS",
+     group = G_FILTER)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// VISUALS
+//──────────────────────────────────────────────────────────────────────────────
+
+string G_VISUAL = "5. Visuals"
+
+color bullishColor = input.color(
+     color.rgb(0, 140, 255),
+     "Bullish SMT",
+     group = G_VISUAL)
+
+color bearishColor = input.color(
+     color.rgb(235, 50, 50),
+     "Bearish SMT",
+     group = G_VISUAL)
+
+color bullishSSColor = input.color(
+     color.rgb(0, 200, 120),
+     "Bullish SS",
+     group = G_VISUAL)
+
+color bearishSSColor = input.color(
+     color.rgb(255, 145, 0),
+     "Bearish SS",
+     group = G_VISUAL)
+
+string lineStyleInput = input.string(
+     "Solid",
+     "SMT Line Style",
+     options = ["Solid", "Dashed", "Dotted"],
+     group = G_VISUAL)
+
+int lineWidth = input.int(
+     1,
+     "SMT Line Width",
+     minval = 1,
+     maxval = 4,
+     group = G_VISUAL)
+
+string labelSizeInput = input.string(
+     "Small",
+     "Label Size",
+     options = ["Tiny", "Small", "Normal", "Large"],
+     group = G_VISUAL)
+
+bool showSSLabels = input.bool(
+     true,
+     "Show SS Labels",
+     group = G_VISUAL)
+
+bool showSwingMarkers = input.bool(
+     false,
+     "Show Swing Markers",
+     group = G_VISUAL)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// TABLE
+//──────────────────────────────────────────────────────────────────────────────
+
+string G_TABLE = "6. Info Table"
+
+bool showTable = input.bool(
+     true,
+     "Show Info Table",
+     group = G_TABLE)
+
+string tablePositionInput = input.string(
+     "Top Right",
+     "Table Position",
+     options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"],
+     group = G_TABLE)
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// FUNCTIONS
+//══════════════════════════════════════════════════════════════════════════════
+
+getSwingBars(string strength) =>
+    switch strength
+        "Low"    => 2
+        "Medium" => 4
+        "Strong" => 7
+        => 4
+
+
+getLineStyle(string styleName) =>
+    switch styleName
+        "Solid"  => line.style_solid
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+
+getLabelSize(string sizeName) =>
+    switch sizeName
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.small
+
+
+getTablePosition(string positionName) =>
+    switch positionName
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        "Bottom Right" => position.bottom_right
+        => position.top_right
+
+
+// Automatic correlated-pair detection.
+//
+// syminfo.root is used instead of syminfo.ticker because futures such as
+// NQ1! normally have a root of NQ.
+
+getAutoPair() =>
+    string root = str.upper(syminfo.root)
+    string prefix = syminfo.prefix
+    string result = ""
+
+    if root == "NQ"
+        result := prefix + ":ES1!"
+    else if root == "ES"
+        result := prefix + ":NQ1!"
+    else if root == "MNQ"
+        result := prefix + ":MES1!"
+    else if root == "MES"
+        result := prefix + ":MNQ1!"
+    else if root == "GC"
+        result := prefix + ":SI1!"
+    else if root == "SI"
+        result := prefix + ":GC1!"
+    else if root == "EURUSD"
+        result := prefix + ":GBPUSD"
+    else if root == "GBPUSD"
+        result := prefix + ":EURUSD"
+    else if root == "BTCUSD"
+        result := prefix + ":ETHUSD"
+    else if root == "ETHUSD"
+        result := prefix + ":BTCUSD"
+    else if root == "BTCUSDT"
+        result := prefix + ":ETHUSDT"
+    else if root == "ETHUSDT"
+        result := prefix + ":BTCUSDT"
+
+    result
+
+
+// Draw the SMT line and label.
+drawSMT(
+     int previousBar,
+     float previousPrice,
+     int currentBar,
+     float currentPrice,
+     bool bullish) =>
+
+    color c = bullish ? bullishColor : bearishColor
+
+    line.new(
+         x1 = previousBar,
+         y1 = previousPrice,
+         x2 = currentBar,
+         y2 = currentPrice,
+         xloc = xloc.bar_index,
+         extend = extend.none,
+         color = c,
+         style = getLineStyle(lineStyleInput),
+         width = lineWidth)
+
+    label.new(
+         x = currentBar,
+         y = currentPrice,
+         xloc = xloc.bar_index,
+         yloc = yloc.price,
+         text = "SMT",
+         style = bullish ? label.style_label_up : label.style_label_down,
+         color = c,
+         textcolor = color.white,
+         size = getLabelSize(labelSizeInput))
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// PAIR CONFIGURATION
+//══════════════════════════════════════════════════════════════════════════════
+
+int swingBars = getSwingBars(swingStrength)
+
+string automaticPair = getAutoPair()
+
+string pairSymbol =
+     autoPair and str.length(automaticPair) > 0
+     ? automaticPair
+     : manualPair
+
+// If no automatic mapping exists, use the chart symbol so the request remains
+// valid. Since it is the same symbol, no meaningful SMT should be produced.
+
+string pairRequest =
+     str.length(pairSymbol) > 0
+     ? pairSymbol
+     : syminfo.tickerid
+
+string secondPairRequest =
+     useSecondPair
+     ? secondPair
+     : syminfo.tickerid
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// CORRELATED DATA
+//══════════════════════════════════════════════════════════════════════════════
+
+[pHigh, pLow, pOpen, pClose, pPivotHigh, pPivotLow] =
+    request.security(
+         pairRequest,
+         timeframe.period,
+         [
+             high,
+             low,
+             open,
+             close,
+             ta.pivothigh(high, swingBars, swingBars),
+             ta.pivotlow(low, swingBars, swingBars)
+         ],
+         gaps = barmerge.gaps_off,
+         lookahead = barmerge.lookahead_off,
+         ignore_invalid_symbol = true)
+
+
+[p2PivotHigh, p2PivotLow] =
+    request.security(
+         secondPairRequest,
+         timeframe.period,
+         [
+             ta.pivothigh(high, swingBars, swingBars),
+             ta.pivotlow(low, swingBars, swingBars)
+         ],
+         gaps = barmerge.gaps_off,
+         lookahead = barmerge.lookahead_off,
+         ignore_invalid_symbol = true)
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// CHART PIVOTS
+//══════════════════════════════════════════════════════════════════════════════
+
+float chartPivotHigh =
+     ta.pivothigh(high, swingBars, swingBars)
+
+float chartPivotLow =
+     ta.pivotlow(low, swingBars, swingBars)
+
+bool newChartHigh =
+     not na(chartPivotHigh)
+
+bool newChartLow =
+     not na(chartPivotLow)
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// LAST TWO CHART HIGH PIVOTS
+//══════════════════════════════════════════════════════════════════════════════
+
+var float chartHighCurrent = na
+var float chartHighPrevious = na
+
+var int chartHighCurrentBar = na
+var int chartHighPreviousBar = na
+
+if newChartHigh
+    chartHighPrevious := chartHighCurrent
+    chartHighPreviousBar := chartHighCurrentBar
+
+    chartHighCurrent := chartPivotHigh
+    chartHighCurrentBar := bar_index - swingBars
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// LAST TWO CHART LOW PIVOTS
+//══════════════════════════════════════════════════════════════════════════════
+
+var float chartLowCurrent = na
+var float chartLowPrevious = na
+
+var int chartLowCurrentBar = na
+var int chartLowPreviousBar = na
+
+if newChartLow
+    chartLowPrevious := chartLowCurrent
+    chartLowPreviousBar := chartLowCurrentBar
+
+    chartLowCurrent := chartPivotLow
+    chartLowCurrentBar := bar_index - swingBars
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// LAST TWO CORRELATED HIGH PIVOTS
+//══════════════════════════════════════════════════════════════════════════════
+
+var float pairHighCurrent = na
+var float pairHighPrevious = na
+
+var int pairHighCurrentBar = na
+var int pairHighPreviousBar = na
+
+if not na(pPivotHigh)
+    pairHighPrevious := pairHighCurrent
+    pairHighPreviousBar := pairHighCurrentBar
+
+    pairHighCurrent := pPivotHigh
+    pairHighCurrentBar := bar_index - swingBars
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// LAST TWO CORRELATED LOW PIVOTS
+//══════════════════════════════════════════════════════════════════════════════
+
+var float pairLowCurrent = na
+var float pairLowPrevious = na
+
+var int pairLowCurrentBar = na
+var int pairLowPreviousBar = na
+
+if not na(pPivotLow)
+    pairLowPrevious := pairLowCurrent
+    pairLowPreviousBar := pairLowCurrentBar
+
+    pairLowCurrent := pPivotLow
+    pairLowCurrentBar := bar_index - swingBars
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// SECOND PAIR PIVOT STORAGE
+//══════════════════════════════════════════════════════════════════════════════
+
+var float pair2HighCurrent = na
+var float pair2HighPrevious = na
+
+var int pair2HighCurrentBar = na
+var int pair2HighPreviousBar = na
+
+if not na(p2PivotHigh)
+    pair2HighPrevious := pair2HighCurrent
+    pair2HighPreviousBar := pair2HighCurrentBar
+
+    pair2HighCurrent := p2PivotHigh
+    pair2HighCurrentBar := bar_index - swingBars
+
+
+var float pair2LowCurrent = na
+var float pair2LowPrevious = na
+
+var int pair2LowCurrentBar = na
+var int pair2LowPreviousBar = na
+
+if not na(p2PivotLow)
+    pair2LowPrevious := pair2LowCurrent
+    pair2LowPreviousBar := pair2LowCurrentBar
+
+    pair2LowCurrent := p2PivotLow
+    pair2LowCurrentBar := bar_index - swingBars
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// PIVOT ALIGNMENT
+//══════════════════════════════════════════════════════════════════════════════
+
+bool lowsAligned =
+     not na(chartLowCurrentBar) and
+     not na(chartLowPreviousBar) and
+     not na(pairLowCurrentBar) and
+     not na(pairLowPreviousBar) and
+     math.abs(chartLowCurrentBar - pairLowCurrentBar) <= pivotMatchBars and
+     math.abs(chartLowPreviousBar - pairLowPreviousBar) <= pivotMatchBars
+
+
+bool highsAligned =
+     not na(chartHighCurrentBar) and
+     not na(chartHighPreviousBar) and
+     not na(pairHighCurrentBar) and
+     not na(pairHighPreviousBar) and
+     math.abs(chartHighCurrentBar - pairHighCurrentBar) <= pivotMatchBars and
+     math.abs(chartHighPreviousBar - pairHighPreviousBar) <= pivotMatchBars
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// SECOND PAIR CONFLUENCE
+//══════════════════════════════════════════════════════════════════════════════
+
+bool secondBullish =
+     not na(chartLowCurrentBar) and
+     not na(chartLowPreviousBar) and
+     not na(pair2LowCurrentBar) and
+     not na(pair2LowPreviousBar) and
+     math.abs(chartLowCurrentBar - pair2LowCurrentBar) <= pivotMatchBars and
+     math.abs(chartLowPreviousBar - pair2LowPreviousBar) <= pivotMatchBars and
+     pair2LowCurrent >= pair2LowPrevious
+
+
+bool secondBearish =
+     not na(chartHighCurrentBar) and
+     not na(chartHighPreviousBar) and
+     not na(pair2HighCurrentBar) and
+     not na(pair2HighPreviousBar) and
+     math.abs(chartHighCurrentBar - pair2HighCurrentBar) <= pivotMatchBars and
+     math.abs(chartHighPreviousBar - pair2HighPreviousBar) <= pivotMatchBars and
+     pair2HighCurrent <= pair2HighPrevious
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// RAW SMT
+//══════════════════════════════════════════════════════════════════════════════
+//
+// BULLISH SMT
+//
+// Chart:
+//      Lower Low
+//
+// Pair:
+//      Higher Low / Equal Low
+//
+// BEARISH SMT
+//
+// Chart:
+//      Higher High
+//
+// Pair:
+//      Lower High / Equal High
+//══════════════════════════════════════════════════════════════════════════════
+
+bool rawBullishSMT =
+     newChartLow and
+     lowsAligned and
+     chartLowCurrent < chartLowPrevious and
+     pairLowCurrent >= pairLowPrevious
+
+
+bool rawBearishSMT =
+     newChartHigh and
+     highsAligned and
+     chartHighCurrent > chartHighPrevious and
+     pairHighCurrent <= pairHighPrevious
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// BIAS FILTER
+//══════════════════════════════════════════════════════════════════════════════
+
+bool bullishBiasAllowed =
+     bias == "Neutral" or bias == "Bullish"
+
+bool bearishBiasAllowed =
+     bias == "Neutral" or bias == "Bearish"
+
+
+bool bullishSMT =
+     rawBullishSMT and
+     bullishBiasAllowed and
+     (
+         not requireSecondPair or
+         not useSecondPair or
+         secondBullish
+     )
+
+
+bool bearishSMT =
+     rawBearishSMT and
+     bearishBiasAllowed and
+     (
+         not requireSecondPair or
+         not useSecondPair or
+         secondBearish
+     )
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// SMT → SS STATE
+//══════════════════════════════════════════════════════════════════════════════
+//
+// pendingDirection:
+//
+//      +1 = bullish SMT waiting for bullish SS
+//      -1 = bearish SMT waiting for bearish SS
+//       0 = nothing pending
+//══════════════════════════════════════════════════════════════════════════════
+
+var int pendingDirection = 0
+var int pendingSMTBar = na
+
+var int pendingCurrentPivotBar = na
+var int pendingPreviousPivotBar = na
+
+var float pendingCurrentPivotPrice = na
+var float pendingPreviousPivotPrice = na
+
+var int consecutiveCount = 0
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// NEW BULLISH SMT
+//══════════════════════════════════════════════════════════════════════════════
+
+if bullishSMT
+
+    pendingDirection := 1
+    pendingSMTBar := bar_index
+
+    pendingCurrentPivotBar := chartLowCurrentBar
+    pendingCurrentPivotPrice := chartLowCurrent
+
+    pendingPreviousPivotBar := chartLowPreviousBar
+    pendingPreviousPivotPrice := chartLowPrevious
+
+    consecutiveCount := 0
+
+    if not onlySS
+        drawSMT(
+             pendingPreviousPivotBar,
+             pendingPreviousPivotPrice,
+             pendingCurrentPivotBar,
+             pendingCurrentPivotPrice,
+             true)
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// NEW BEARISH SMT
+//══════════════════════════════════════════════════════════════════════════════
+
+if bearishSMT
+
+    pendingDirection := -1
+    pendingSMTBar := bar_index
+
+    pendingCurrentPivotBar := chartHighCurrentBar
+    pendingCurrentPivotPrice := chartHighCurrent
+
+    pendingPreviousPivotBar := chartHighPreviousBar
+    pendingPreviousPivotPrice := chartHighPrevious
+
+    consecutiveCount := 0
+
+    if not onlySS
+        drawSMT(
+             pendingPreviousPivotBar,
+             pendingPreviousPivotPrice,
+             pendingCurrentPivotBar,
+             pendingCurrentPivotPrice,
+             false)
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// STRENGTH SWITCH CANDLE
+//══════════════════════════════════════════════════════════════════════════════
+//
+// Bullish SS:
+//
+//      Chart closes UP
+//      Pair closes DOWN
+//
+// Bearish SS:
+//
+//      Chart closes DOWN
+//      Pair closes UP
+//
+// This represents the relative-strength relationship switching after SMT.
+//══════════════════════════════════════════════════════════════════════════════
+
+bool bullishSSBar = false
+bool bearishSSBar = false
+
+if ssMode == "Relative Close"
+
+    bullishSSBar :=
+         close > close[1] and
+         pClose < pClose[1]
+
+    bearishSSBar :=
+         close < close[1] and
+         pClose > pClose[1]
+
+else
+
+    bullishSSBar :=
+         close > open and
+         pClose < pOpen
+
+    bearishSSBar :=
+         close < open and
+         pClose > pOpen
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// SS EVENTS
+//══════════════════════════════════════════════════════════════════════════════
+
+bool bullishSSEvent = false
+bool bearishSSEvent = false
+
+
+if pendingDirection != 0 and not na(pendingSMTBar)
+
+    int age = bar_index - pendingSMTBar
+
+    //──────────────────────────────────────────────────────────────────────────
+    // EXPIRED
+    //──────────────────────────────────────────────────────────────────────────
+
+    if age > ssWindow
+
+        pendingDirection := 0
+        pendingSMTBar := na
+
+        pendingCurrentPivotBar := na
+        pendingPreviousPivotBar := na
+
+        pendingCurrentPivotPrice := na
+        pendingPreviousPivotPrice := na
+
+        consecutiveCount := 0
+
+
+    //──────────────────────────────────────────────────────────────────────────
+    // CHECK FOR SS
+    //──────────────────────────────────────────────────────────────────────────
+
+    else if age > 0
+
+        // BULLISH SMT → looking for bullish SS
+        if pendingDirection == 1
+
+            if bullishSSBar
+                consecutiveCount += 1
+            else
+                consecutiveCount := 0
+
+            if consecutiveCount >= ssConsecutive
+                bullishSSEvent := true
+
+
+        // BEARISH SMT → looking for bearish SS
+        if pendingDirection == -1
+
+            if bearishSSBar
+                consecutiveCount += 1
+            else
+                consecutiveCount := 0
+
+            if consecutiveCount >= ssConsecutive
+                bearishSSEvent := true
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// BULLISH SS
+//══════════════════════════════════════════════════════════════════════════════
+
+if bullishSSEvent
+
+    // If onlySS is enabled, draw the SMT only after confirmation.
+    if onlySS
+
+        drawSMT(
+             pendingPreviousPivotBar,
+             pendingPreviousPivotPrice,
+             pendingCurrentPivotBar,
+             pendingCurrentPivotPrice,
+             true)
+
+    if showSSLabels
+
+        label.new(
+             x = bar_index,
+             y = low,
+             xloc = xloc.bar_index,
+             yloc = yloc.belowbar,
+             text = "SS",
+             style = label.style_label_up,
+             color = bullishSSColor,
+             textcolor = color.white,
+             size = getLabelSize(labelSizeInput))
+
+    pendingDirection := 0
+    pendingSMTBar := na
+    consecutiveCount := 0
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// BEARISH SS
+//══════════════════════════════════════════════════════════════════════════════
+
+if bearishSSEvent
+
+    if onlySS
+
+        drawSMT(
+             pendingPreviousPivotBar,
+             pendingPreviousPivotPrice,
+             pendingCurrentPivotBar,
+             pendingCurrentPivotPrice,
+             false)
+
+    if showSSLabels
+
+        label.new(
+             x = bar_index,
+             y = high,
+             xloc = xloc.bar_index,
+             yloc = yloc.abovebar,
+             text = "SS",
+             style = label.style_label_down,
+             color = bearishSSColor,
+             textcolor = color.white,
+             size = getLabelSize(labelSizeInput))
+
+    pendingDirection := 0
+    pendingSMTBar := na
+    consecutiveCount := 0
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// SWING MARKERS
+//══════════════════════════════════════════════════════════════════════════════
+//
+// IMPORTANT:
+// plot() offset must be a SIMPLE integer.
+// Therefore the three swing settings use fixed offsets instead of:
+//
+//     offset = -swingBars
+//
+// which caused the compiler error in your screenshot.
+//══════════════════════════════════════════════════════════════════════════════
+
+bool showLow =
+     showSwingMarkers and swingStrength == "Low"
+
+bool showMedium =
+     showSwingMarkers and swingStrength == "Medium"
+
+bool showStrong =
+     showSwingMarkers and swingStrength == "Strong"
+
+
+// LOW = 2
+plot(
+     showLow ? chartPivotHigh : na,
+     title = "Low Swing High",
+     color = color.new(bearishColor, 45),
+     linewidth = 2,
+     style = plot.style_circles,
+     offset = -2)
+
+plot(
+     showLow ? chartPivotLow : na,
+     title = "Low Swing Low",
+     color = color.new(bullishColor, 45),
+     linewidth = 2,
+     style = plot.style_circles,
+     offset = -2)
+
+
+// MEDIUM = 4
+plot(
+     showMedium ? chartPivotHigh : na,
+     title = "Medium Swing High",
+     color = color.new(bearishColor, 45),
+     linewidth = 2,
+     style = plot.style_circles,
+     offset = -4)
+
+plot(
+     showMedium ? chartPivotLow : na,
+     title = "Medium Swing Low",
+     color = color.new(bullishColor, 45),
+     linewidth = 2,
+     style = plot.style_circles,
+     offset = -4)
+
+
+// STRONG = 7
+plot(
+     showStrong ? chartPivotHigh : na,
+     title = "Strong Swing High",
+     color = color.new(bearishColor, 45),
+     linewidth = 2,
+     style = plot.style_circles,
+     offset = -7)
+
+plot(
+     showStrong ? chartPivotLow : na,
+     title = "Strong Swing Low",
+     color = color.new(bullishColor, 45),
+     linewidth = 2,
+     style = plot.style_circles,
+     offset = -7)
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+//══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(
+     bullishSMT,
+     title = "Bullish SMT",
+     message = "Bullish SMT detected.")
+
+alertcondition(
+     bearishSMT,
+     title = "Bearish SMT",
+     message = "Bearish SMT detected.")
+
+alertcondition(
+     bullishSSEvent,
+     title = "Bullish Strength Switch",
+     message = "Bullish Strength Switch confirmed.")
+
+alertcondition(
+     bearishSSEvent,
+     title = "Bearish Strength Switch",
+     message = "Bearish Strength Switch confirmed.")
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// INFORMATION TABLE
+//══════════════════════════════════════════════════════════════════════════════
+
+var table infoTable = table.new(
+     getTablePosition(tablePositionInput),
+     2,
+     7,
+     bgcolor = color.new(color.black, 15),
+     border_width = 1)
+
+
+if barstate.islast
+
+    if showTable
+
+        string displayPair =
+             str.length(pairSymbol) > 0
+             ? pairSymbol
+             : "Not detected"
+
+        string displaySecondPair =
+             useSecondPair
+             ? secondPair
+             : "Disabled"
+
+        string displayState =
+             pendingDirection == 1
+             ? "Bullish SMT → SS"
+             : pendingDirection == -1
+             ? "Bearish SMT → SS"
+             : "No pending SMT"
+
+        color stateColor =
+             pendingDirection == 1
+             ? bullishColor
+             : pendingDirection == -1
+             ? bearishColor
+             : color.white
+
+        table.cell(
+             infoTable,
+             0,
+             0,
+             "SMT + SS",
+             text_color = color.white,
+             bgcolor = color.rgb(35, 35, 35))
+
+        table.cell(
+             infoTable,
+             1,
+             0,
+             "ACTIVE",
+             text_color = color.lime,
+             bgcolor = color.rgb(35, 35, 35))
+
+        table.cell(
+             infoTable,
+             0,
+             1,
+             "Chart",
+             text_color = color.gray)
+
+        table.cell(
+             infoTable,
+             1,
+             1,
+             syminfo.ticker,
+             text_color = color.white)
+
+        table.cell(
+             infoTable,
+             0,
+             2,
+             "SMT Pair",
+             text_color = color.gray)
+
+        table.cell(
+             infoTable,
+             1,
+             2,
+             displayPair,
+             text_color = color.white)
+
+        table.cell(
+             infoTable,
+             0,
+             3,
+             "2nd Pair",
+             text_color = color.gray)
+
+        table.cell(
+             infoTable,
+             1,
+             3,
+             displaySecondPair,
+             text_color = color.white)
+
+        table.cell(
+             infoTable,
+             0,
+             4,
+             "Swing",
+             text_color = color.gray)
+
+        table.cell(
+             infoTable,
+             1,
+             4,
+             swingStrength + " / " + str.tostring(swingBars),
+             text_color = color.white)
+
+        table.cell(
+             infoTable,
+             0,
+             5,
+             "Bias",
+             text_color = color.gray)
+
+        table.cell(
+             infoTable,
+             1,
+             5,
+             bias,
+             text_color =
+                 bias == "Bullish"
+                 ? bullishColor
+                 : bias == "Bearish"
+                 ? bearishColor
+                 : color.white)
+
+        table.cell(
+             infoTable,
+             0,
+             6,
+             "State",
+             text_color = color.gray)
+
+        table.cell(
+             infoTable,
+             1,
+             6,
+             displayState,
+             text_color = stateColor)
+
+    else
+
+        table.clear(
+             infoTable,
+             0,
+             0,
+             1,
+             6)
