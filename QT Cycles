@@ -1,0 +1,957 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Danielliuks
+
+//@version=6
+indicator("Quarterly Theory Cycles [Oracle]", overlay = false, max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ─── Settings ────────────────────────────────────────────────────────────────
+useManual = input.bool(false, "Manual selection",
+     group   = "Cycles",
+     tooltip = "On: choose each cycle layer individually.\nOff: auto-show N layers starting from the chart's own timeframe.")
+tfs = input.int(2, "Layers to show", minval = 1, maxval = 8,
+     group   = "Cycles",
+     inline  = "auto",
+     active  = not useManual,
+     tooltip = "Number of cycle layers displayed, ascending from the chart timeframe.")
+
+showNano       = input.bool(true, "Nano",       group = "Cycles", inline = "r1", active = useManual)
+showMicro      = input.bool(true, "Micro",      group = "Cycles", inline = "r1", active = useManual)
+show90m        = input.bool(true, "90m",        group = "Cycles", inline = "r1", active = useManual)
+showDaily      = input.bool(true, "Daily",      group = "Cycles", inline = "r2", active = useManual)
+showWeekly     = input.bool(true, "Weekly",     group = "Cycles", inline = "r2", active = useManual)
+showMonthly    = input.bool(true, "Monthly",    group = "Cycles", inline = "r2", active = useManual)
+showYearly     = input.bool(true, "Yearly",     group = "Cycles", inline = "r3", active = useManual)
+showQuadrenial = input.bool(true, "Quadrenial", group = "Cycles", inline = "r3", active = useManual)
+
+showOnChart   = input.bool(false, "Show on-chart cycles", group = "On-Chart", inline = "oc")
+onlyOnChart   = input.bool(false, "Only",                 group = "On-Chart", inline = "oc",
+     active   = showOnChart,
+     tooltip  = "Hide the lower pane cycles and show only the on-chart overlay.")
+showPrevCycle = input.bool(true, "Show previous period on Q1", group = "On-Chart",
+     active   = showOnChart,
+     tooltip  = "When in Q1 of the highest visible cycle, keeps the previous full cycle visible at the same height.")
+
+q1_c = input.color(color.new(color.gray,   50), "Q1", group = "Colors", inline = "qc")
+q2_c = input.color(color.new(color.red,    50), "Q2", group = "Colors", inline = "qc")
+q3_c = input.color(color.new(color.green,  50), "Q3", group = "Colors", inline = "qc")
+q4_c = input.color(color.new(color.blue,   50), "Q4", group = "Colors", inline = "qc")
+q0_c = input.color(color.new(color.orange, 70), "Q0", group = "Colors", inline = "qc")
+
+textColor    = input.color(color.white,                "Text",     group = "Colors", inline = "tc")
+divLineColor = input.color(color.new(color.gray,  40), "Dividers", group = "Colors", inline = "lc")
+divLineWidth = input.int(1,        "",  minval = 1, maxval = 4,    group = "Colors", inline = "lc")
+divLineStyle = input.string("Dotted", "", options = ["Solid","Dashed","Dotted"], group = "Colors", inline = "lc")
+// ─────────────────────────────────────────────────────────────────────────────
+
+exchangeTimeZone = syminfo.prefix == "FX" ? "America/New_York" : syminfo.prefix == "BINANCE" ? "UTC" : syminfo.prefix == "CME" ? "America/Chicago" : "Etc/UTC"
+
+DAY_START_HOUR = switch syminfo.prefix
+    "FX"          => 18
+    "FOREXCOM"    => 18
+    "OANDA"       => 18
+    "CMCMARKETS"  => 17
+    "CME"         => 17
+    "CBOT"        => 17
+    "CBOT_MINI"   => 17
+    "CBOT_MINI_DL" => 17
+    "CBOT_DL"     => 17
+    "CME_MINI"    => 17
+    "CME_DL"      => 17
+    "CME_MINI_DL" => 17
+    "BINANCE"     => 22
+    "BYBIT"       => 22
+    "KRAKEN"      => 22
+    "GATE.IO"     => 22
+    "BITSTAMP"    => 22
+    "COINBASE"    => 22
+    "GEMINI"      => 22
+    => 18
+
+DAY_START = timestamp(year, month, dayofmonth, DAY_START_HOUR, 0)
+
+// ─── Functions ───────────────────────────────────────────────────────────────
+daysPerMonth(int yearNumber, int monthNumber) =>
+    bool leapYear = (yearNumber % 4 == 0 and yearNumber % 100 != 0) or (yearNumber % 400 == 0)
+    int result = switch
+        monthNumber == 2 => leapYear ? 29 : 28
+        => 31 - (monthNumber - 1) % 7 % 2
+
+// A month's Week 1 begins on the Sunday 18:00 immediately before its first Monday — Sunday
+// evening is just that week's open, Monday is the week's real first trading day, so a month
+// "owns" whichever week its first Monday falls in. The span from this anchor to next month's
+// is then always exactly 4 or 5 weeks on its own, self-consistently, with no cross-month lookup
+// needed — a leftover 5th week is that same month's Joker Week. (An earlier version anchored to
+// the Sunday on-or-after the 1st instead, which usually lands on the same Sunday but is wrong
+// specifically when the 1st itself is a Monday: on-or-after then jumps a full week too late,
+// handing that Monday's real first week to the previous month's Joker Week instead of this
+// month's Week 1. And an even earlier version anchored to the Sunday on-or-before the 1st, and
+// tried to reconcile that against the previous month with a "push forward a week" step — but
+// that push compared only against the previous month's own un-pushed anchor, so it silently
+// forgot whether that month itself had already been pushed, misplacing weeks near month
+// boundaries; chaining against the previous month's actual resolution instead doesn't fix it
+// either, since that drifts unboundedly (confirmed by simulation: ~15 years off over a century
+// of bars), because once a month gets pushed by a full 5-week block, real ~30-day months never
+// catch back up, so every later month keeps getting pushed too.)
+monthWeekAnchorNy(int yearNumber, int monthNumber) =>
+    int monthStart = timestamp("America/New_York", yearNumber, monthNumber, 1, 0, 0)
+    int daysToMonday = (dayofweek.monday - dayofweek(monthStart, "America/New_York") + 7) % 7
+    timestamp("America/New_York", yearNumber, monthNumber, 1, 18, 0) + (daysToMonday - 1) * 24 * 60 * 60 * 1000
+
+getMonthlyWeekNy() =>
+    string tz = "America/New_York"
+    int yearNy = year(time, tz)
+    int monthNy = month(time, tz)
+    int anchor = monthWeekAnchorNy(yearNy, monthNy)
+    if time < anchor
+        yearNy := monthNy == 1 ? yearNy - 1 : yearNy
+        monthNy := monthNy == 1 ? 12 : monthNy - 1
+        anchor := monthWeekAnchorNy(yearNy, monthNy)
+    else
+        int nextYear  = monthNy == 12 ? yearNy + 1 : yearNy
+        int nextMonth = monthNy == 12 ? 1 : monthNy + 1
+        int nextAnchor = monthWeekAnchorNy(nextYear, nextMonth)
+        if time >= nextAnchor
+            yearNy := nextYear
+            monthNy := nextMonth
+            anchor := nextAnchor
+    int weekNo = math.floor((time - anchor + 5400000) / (7 * 24 * 60 * 60 * 1000)) + 1
+    int cycleNum = weekNo >= 1 and weekNo <= 4 ? weekNo : 0
+    // "New week" fires on whichever bar is first to cross each weekly threshold, instead of
+    // requiring an exact Sunday-18:00 bar to exist — some FX/crypto 4H feeds don't have an
+    // 18:00 open at all (e.g. grids of 01/05/09/13/17/21 or 00/04/08/12/16/20), so hour(time,
+    // tz)==18 was never true there and the monthly-week cycle silently stopped advancing.
+    // This can't reuse weekNo/cycleNum above though: their "+5400000" (90-minute) nudge shifts
+    // their own transition point to ~16:30 Sunday instead of the true 18:00 anchor. That drift
+    // is invisible on grids whose pre-18:00 candle already opens well before 16:30 (crypto's
+    // 16:00->20:00 gap still spans across it, landing on 20:00 either way), but on grids where
+    // 16:30 falls in an earlier gap than 18:00 does (FX's 13:00->17:00 gap contains 16:30, one
+    // slot before the 17:00->21:00 gap that actually contains 18:00) it fires a whole candle
+    // early — 17:00 instead of 21:00. So detect the transition on a second, unfudged version of
+    // the same floor-division that crosses exactly at 18:00, independent of how weekNo/cycleNum
+    // themselves are numbered (left untouched above, since that part was already correct).
+    int weekNoRaw = math.floor((time - anchor) / (7 * 24 * 60 * 60 * 1000))
+    bool newWeek = not na(weekNoRaw[1]) and weekNoRaw != weekNoRaw[1]
+    [newWeek, cycleNum]
+
+// Buckets an arbitrary chart/request timeframe into the nearest canonical cycle timeframe
+normalizeTimeframe(string tf) =>
+    sec = timeframe.in_seconds(tf)
+    _15S = timeframe.in_seconds("15S")
+    _30S = timeframe.in_seconds("30S")
+    _45S = timeframe.in_seconds("45S")
+    _1   = timeframe.in_seconds("1")
+    _5   = timeframe.in_seconds("5")
+    _15  = timeframe.in_seconds("15")
+    _60  = timeframe.in_seconds("60")
+    _90  = timeframe.in_seconds("90")
+    _240 = timeframe.in_seconds("240")
+    _360 = timeframe.in_seconds("360")
+    _1D  = timeframe.in_seconds("1D")
+    _1W  = timeframe.in_seconds("1W")
+    result = "1M"
+    if sec <= _15S
+        result := "15S"
+    else if sec <= _30S
+        result := "30S"
+    else if sec <= _45S
+        result := "45S"
+    else if sec <= _1
+        result := "1"
+    else if sec <= _5
+        result := "5"
+    else if sec <= _15
+        result := "15"
+    else if sec <= _60
+        result := "60"
+    else if sec <= _90
+        result := "90"
+    else if sec <= _240
+        result := "240"
+    else if sec <= _360
+        result := "360"
+    else if sec <= _1D
+        result := "1D"
+    else if sec <= _1W
+        result := "1W"
+    result
+
+resolveLineStyle(string s) =>
+    switch s
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+getCycle(tf) =>
+    tf_norm = normalizeTimeframe(tf)
+    var bool new_Cycle_start_ = false
+    var int cycle_idx = na
+    var int random = na
+
+    if tf_norm == '15S'
+        DAY_START_ = timestamp(year, month, dayofmonth, DAY_START_HOUR, 0)
+
+        // Micro cycle anchor times (same as before)
+        open1_min = DAY_START_HOUR == 17 ? 22 : 52
+        open1_sec = 30
+        open2_min = DAY_START_HOUR == 17 ? 0 : 30
+        open2_sec = 0
+
+        micro_start1 = DAY_START_ + timestamp(0, 0, 0, 0, open1_min, open1_sec)
+        micro_start2 = DAY_START_ + timestamp(0, 0, 0, 0, open2_min, open2_sec)
+
+        now = timestamp(year, month, dayofmonth, hour, minute, second)
+
+        // Micro = 22.5m, Nano = 5.625m = 5m37.5s = 337,500 ms
+        micro_interval = 22.5 * 60 * 1000
+        nano_interval = 5 * 60 * 1000 + 37500
+        bar_duration = 15 * 1000
+
+        // Last micro quarter start
+        micro_ref = now >= micro_start2 ? micro_start2 + math.floor((now - micro_start2) / micro_interval) * micro_interval : micro_start1 + math.floor((now - micro_start1) / micro_interval) * micro_interval
+
+        // Nano quarters start from micro_ref
+        nano1_start = micro_ref
+        nano2_start = nano1_start + nano_interval
+        nano3_start = nano2_start + nano_interval
+        nano4_start = nano3_start + nano_interval
+
+        // Which nano quarter are we in?
+        if now >= nano1_start and now < nano2_start
+            cycle_idx := 1
+        else if now >= nano2_start and now < nano3_start
+            cycle_idx := 2
+        else if now >= nano3_start and now < nano4_start
+            cycle_idx := 3
+        else if now >= nano4_start and now < micro_ref + micro_interval
+            cycle_idx := 4
+
+        // Round nano starts to nearest 15s (align with bar open time)
+
+        rounded_now = now
+
+        new_Cycle_start_ := rounded_now == nano1_start - (nano1_start % bar_duration) or rounded_now == nano2_start + (nano2_start % bar_duration) or rounded_now == nano3_start + (nano3_start % bar_duration) or rounded_now == nano4_start + (nano4_start % bar_duration)
+
+    else if tf_norm == '30S' or tf_norm == '45S'
+
+        DAY_START_ = timestamp(year, month, dayofmonth, DAY_START_HOUR, 0)
+
+        // Seconds-aware offsets
+        open1_min = DAY_START_HOUR == 17 ? 22 : 52
+        open1_sec = 30
+        open2_min = DAY_START_HOUR == 17 ? 0 : 30
+        open2_sec = 0
+
+        interval = 45 * 60 * 1000  // 45 minutes in ms
+
+        now = timestamp(year, month, dayofmonth, hour, minute, second)
+
+        // Calculate time since the open points
+        cond1 = now - (DAY_START_ + timestamp(0, 0, 0, 0, open1_min, open1_sec))
+        cond2 = now - (DAY_START_ + timestamp(0, 0, 0, 0, open2_min, open2_sec))
+
+
+        new_Cycle_start_ := cond1 % interval == 0 or cond2 % interval == 0
+
+        cycles_since_start = math.floor(cond1 / interval / 0.5) + 1
+        cycle_idx := cycles_since_start % 4 + 1
+
+
+    else if tf_norm == '1'
+        DAY_START_ = timestamp(year, month, dayofmonth, DAY_START_HOUR, 0)
+
+        open1 = DAY_START_HOUR == 17 ? 23 : 53
+        open2 = DAY_START_HOUR == 17 ? 0 : 30
+
+        interval = 45 * 60 * 1000
+        cond1 = timestamp(year, month, dayofmonth, hour, minute) - (DAY_START_ + timestamp(0, 0, 0, 0, open1)) // 23 -> 53
+        cond2 = timestamp(year, month, dayofmonth, hour, minute) - (DAY_START_ + timestamp(0, 0, 0, 0, open2)) // 0 -> 30
+        new_Cycle_start_ := cond1 % interval == 0 or cond2 % interval == 0
+        cycles_since_start = math.floor(cond1 / interval / 0.5) + 1
+        cycle_idx := cycles_since_start % 4 + 1
+        hour_ = hour(time, "America/New_York")
+        if (hour_ % 3 == 0 and minute == 0) or (hour_ % 3 == 1 and minute == 30)
+            cycle_idx := 1
+        if (hour_ % 3 == 1 and minute == 53) or (hour_ % 3 == 0 and minute == 23)
+            cycle_idx := 2
+        if (hour_ % 3 == 0 and minute == 45) or (hour_ % 3 == 2 and minute == 15)
+            cycle_idx := 3
+        if (hour_ % 3 == 2 and minute == 38) or (hour_ % 3 == 1 and minute == 8)
+            cycle_idx := 4
+        if timeframe.period == "15S"
+            var int cycle_idx_ = na
+            open1_min_ = DAY_START_HOUR == 17 ? 22 : 52
+            open1_sec_ = 30
+            open2_min_ = DAY_START_HOUR == 17 ? 0 : 30
+            open2_sec_ = 0
+            micro_start1_ = DAY_START_ + timestamp(0, 0, 0, 0, open1_min_, open1_sec_)
+            micro_start2_ = DAY_START_ + timestamp(0, 0, 0, 0, open2_min_, open2_sec_)
+            now_ = timestamp(year, month, dayofmonth, hour, minute, second)
+            micro_interval_ = 22.5 * 60 * 1000
+            nano_interval_  = 5 * 60 * 1000 + 37500
+            bar_duration_   = 15 * 1000
+            micro_ref_ = now_ >= micro_start2_ ? micro_start2_ + math.floor((now_ - micro_start2_) / micro_interval_) * micro_interval_ : micro_start1_ + math.floor((now_ - micro_start1_) / micro_interval_) * micro_interval_
+            nano1_start_ = micro_ref_
+            nano2_start_ = nano1_start_ + nano_interval_
+            nano3_start_ = nano2_start_ + nano_interval_
+            nano4_start_ = nano3_start_ + nano_interval_
+            if now_ >= nano1_start_ and now_ < nano2_start_
+                cycle_idx_ := 1
+            else if now_ >= nano2_start_ and now_ < nano3_start_
+                cycle_idx_ := 2
+            else if now_ >= nano3_start_ and now_ < nano4_start_
+                cycle_idx_ := 3
+            else if now_ >= nano4_start_ and now_ < micro_ref_ + micro_interval_
+                cycle_idx_ := 4
+            rounded_now_ = now_
+            new_Cycle_start_ := rounded_now_ == nano1_start_ - (nano1_start_ % bar_duration_) or rounded_now_ == nano2_start_ + (nano2_start_ % bar_duration_) or rounded_now_ == nano3_start_ + (nano3_start_ % bar_duration_) or rounded_now_ == nano4_start_ + (nano4_start_ % bar_duration_)
+            new_Cycle_start_ := new_Cycle_start_ and cycle_idx_ == 1
+
+    else if tf_norm == '5'
+        interval = 45 * 2 * 60 * 1000
+        cond = timestamp(year, month, dayofmonth, hour, minute) - DAY_START
+        new_Cycle_start_ := cond % interval == 0
+        cycles_since_start = math.floor(cond / interval)
+        cycle_idx := cycles_since_start % 4 + 1
+        if cycle_idx == -2
+            cycle_idx := 2
+        if cycle_idx == -1
+            cycle_idx := 3
+        if cycle_idx == 0
+            cycle_idx := 4
+        new_Cycle_start_ := ta.change(time("90")) != 0
+
+    else if tf_norm == '15'
+        interval = 45 * 8 * 60 * 1000
+        cond = timestamp(year, month, dayofmonth, hour, minute) - DAY_START
+        new_Cycle_start_ := cond % interval == 0
+        cycle_idx := if hour >= 17 and hour < DAY_START_HOUR + 6
+            1
+        else if hour >= 23 or hour < DAY_START_HOUR - 12
+            2
+        else if hour >= DAY_START_HOUR - 12 and hour < DAY_START_HOUR - 6
+            3
+        else if hour >= DAY_START_HOUR - 6 and hour < DAY_START_HOUR
+            4
+        new_Cycle_start_ := ta.change(time("360")) != 0
+
+    else if tf_norm == '60' or tf_norm == '90'
+        interval = 45 * 32 * 60 * 1000
+        cond = timestamp(year, month, dayofmonth, hour, minute) - DAY_START
+        new_Cycle_start_ := cond % interval == 0
+        cycle_idx := switch
+            (hour >= 18 and dayofweek == dayofweek.sunday)    or (hour <= 17 and dayofweek == dayofweek.monday)    => 1
+            (hour >= 18 and dayofweek == dayofweek.monday)    or (hour <= 17 and dayofweek == dayofweek.tuesday)   => 2
+            (hour >= 18 and dayofweek == dayofweek.tuesday)   or (hour <= 17 and dayofweek == dayofweek.wednesday) => 3
+            (hour >= 18 and dayofweek == dayofweek.wednesday) or (hour <= 17 and dayofweek == dayofweek.thursday)  => 4
+            (hour >= 18 and dayofweek == dayofweek.thursday)  or (hour <= 17 and dayofweek == dayofweek.friday)    => 0
+            (hour >= 18 and dayofweek == dayofweek.friday)    or (hour < 18 and dayofweek == dayofweek.saturday)   => 5
+            (hour >= 18 and dayofweek == dayofweek.saturday)  or (hour < 18 and dayofweek == dayofweek.sunday)     => 6
+
+        if new_Cycle_start_ and cycle_idx != 4
+            cycle_idx += 1
+        else if new_Cycle_start_ and cycle_idx == 4
+            cycle_idx := 0
+        if (hour >= 18 and dayofweek == dayofweek.thursday) or (hour < 18 and dayofweek == dayofweek.friday)
+            cycle_idx := 0
+        else if (hour >= 18 and dayofweek == dayofweek.friday) or (hour < 18 and dayofweek == dayofweek.saturday)
+            cycle_idx := 5
+        else if (hour >= 18 and dayofweek == dayofweek.saturday) or (hour < 18 and dayofweek == dayofweek.sunday)
+            cycle_idx := 6
+        new_Cycle_start_ := ta.change(time("1D")) != 0
+        if na(cycle_idx)
+            cycle_idx := 1
+
+    else if tf_norm == '240' or tf_norm == '360'
+        new_Cycle_start_ := ta.change(time("1W")) != 0
+
+        if (dayofmonth == daysPerMonth(year, month) and dayofmonth[1] != daysPerMonth(year, month)) or (dayofmonth >= 1 and dayofmonth[1] > dayofmonth and not new_Cycle_start_[2])
+            cycle_idx := 0
+
+        if new_Cycle_start_ and cycle_idx != 4
+            cycle_idx += 1
+        else if new_Cycle_start_ and cycle_idx == 4
+            cycle_idx := 0
+
+    else if tf_norm == '1W' or tf_norm == '1D'
+        new_Cycle_start_ := (dayofmonth <= 7 and month % 3 == 1 and month[1] % 3 != 1)
+        //new_Cycle_start_ := (new_Cycle_start_ and not ((month[1] == 12 and dayofmonth[1] == 31))) or (month == 12 and dayofmonth == 31)
+
+        if month >= 1 and month <= 3
+            cycle_idx := 1
+        if month >= 4 and month <= 6
+            cycle_idx := 2
+        if month >= 7 and month <= 9
+            cycle_idx := 3
+        if month >= 10 and month <= 12
+            cycle_idx := 4
+    else if tf_norm == '1M'
+        tz = "America/New_York"
+        year_       = year(time, tz)
+        month_      = month(time, tz)
+        dayofmonth_ = dayofmonth(time, tz)
+        new_Cycle_start_ := ((year_ != year_[1]) and not ((month_[1] == 12 and dayofmonth_[1] == 31))) or (month_ == 12 and dayofmonth_ == 31)
+        if year_ % 4 == 3
+            cycle_idx := 1
+        if year_ % 4 == 0
+            cycle_idx := 2
+        if year_ % 4 == 1
+            cycle_idx := 3
+        if year_ % 4 == 2
+            cycle_idx := 4
+
+    [new_Cycle_start_, cycle_idx, random]
+
+getQuarterTexts(tf, useOriginal) =>
+    var string q1 = "Q1"
+    var string q2 = "Q2"
+    var string q3 = "Q3"
+    var string q4 = "Q4"
+    var string q0 = "Q0"
+    if not useOriginal
+        if tf == "15"
+            q1 := "Asia"
+            q2 := "London"
+            q3 := "NY AM"
+            q4 := "NY PM"
+            q0 := "Q0"
+        else if tf == "60"
+            q1 := "Monday"
+            q2 := "Tuesday"
+            q3 := "Wednesday"
+            q4 := "Thursday"
+            q0 := "Friday"
+        else if tf == "240"
+            q1 := "Week 1"
+            q2 := "Week 2"
+            q3 := "Week 3"
+            q4 := "Week 4"
+            q0 := "Joker Week"
+        else
+            q1 := "Q1"
+            q2 := "Q2"
+            q3 := "Q3"
+            q4 := "Q4"
+            q0 := "Q0"
+    [q1, q2, q3, q4, q0]
+
+[txt_q1, txt_q2, txt_q3, txt_q4, txt_q0] = getQuarterTexts(timeframe.period, true)
+
+get_custom_cycle_txt(cycleNum, tf) =>
+    [ttxt_q1, ttxt_q2, ttxt_q3, ttxt_q4, ttxt_q0] = getQuarterTexts(tf, false)
+    txt = ""
+    if cycleNum == 1
+        txt := ttxt_q1
+    if cycleNum == 2
+        txt := ttxt_q2
+    if cycleNum == 3
+        txt := ttxt_q3
+    if cycleNum == 4
+        txt := ttxt_q4
+    if cycleNum == 0
+        txt := ttxt_q0
+    if tf == "60" and cycleNum == 5
+        txt := "Saturday"
+    if tf == "60" and cycleNum == 6
+        txt := "Sunday"
+    txt
+// ─── On-Chart helper functions ────────────────────────────────────────────────
+
+oc_open_box(box[] boxes, line[] lines, int cyclenum, int bidx, float ch, float bh, float lhi, float llo, string tf_str) =>
+    c = cyclenum == 1 ? q1_c : cyclenum == 2 ? q2_c : cyclenum == 3 ? q3_c : cyclenum == 4 ? q4_c : q0_c
+    if array.size(boxes) > 0
+        array.last(boxes).set_right(bar_index)
+    sep = line.new(bar_index, llo, bar_index, lhi,
+         color         = divLineColor,
+         width         = divLineWidth,
+         style         = resolveLineStyle(divLineStyle),
+         force_overlay = true)
+    array.push(lines, sep)
+    b = box.new(bar_index, ch + (bidx + 2) * bh, bar_index + 1, ch + (bidx + 1) * bh,
+         bgcolor       = c,
+         border_color  = color.new(color.white, 70),
+         text          = get_custom_cycle_txt(cyclenum, tf_str),
+         text_size     = size.small,
+         text_color    = textColor,
+         text_halign   = text.align_center,
+         force_overlay = true)
+    array.push(boxes, b)
+
+oc_create_box(box[] boxes, int cyclenum, int bidx, float ch, float bh, string tf_str) =>
+    c = cyclenum == 1 ? q1_c : cyclenum == 2 ? q2_c : cyclenum == 3 ? q3_c : cyclenum == 4 ? q4_c : q0_c
+    b = box.new(bar_index, ch + (bidx + 2) * bh, bar_index + 1, ch + (bidx + 1) * bh,
+         bgcolor       = c,
+         border_color  = color.new(color.white, 70),
+         text          = get_custom_cycle_txt(cyclenum, tf_str),
+         text_size     = size.small,
+         text_color    = textColor,
+         text_halign   = text.align_center,
+         force_overlay = true)
+    array.push(boxes, b)
+
+oc_sync_band(box[] boxes, int bidx, float ch, float bh) =>
+    for b in boxes
+        b.set_top(ch + (bidx + 2) * bh)
+        b.set_bottom(ch + (bidx + 1) * bh)
+        b.set_text_color(textColor)
+
+oc_sync_lines(line[] lines, float lhi, float llo) =>
+    for l in lines
+        l.set_y1(llo)
+        l.set_y2(lhi)
+        l.set_color(divLineColor)
+        l.set_width(divLineWidth)
+        l.set_style(resolveLineStyle(divLineStyle))
+
+oc_hand_off_boxes(box[] src, box[] dst) =>
+    for b in dst
+        box.delete(b)
+    array.clear(dst)
+    for b in src
+        array.push(dst, b)
+    array.clear(src)
+
+oc_hand_off_lines(line[] src, line[] dst) =>
+    for l in dst
+        line.delete(l)
+    array.clear(dst)
+    for l in src
+        array.push(dst, l)
+    array.clear(src)
+
+oc_delete_boxes(box[] boxes) =>
+    for b in boxes
+        box.delete(b)
+    array.clear(boxes)
+
+oc_delete_lines(line[] lines) =>
+    for l in lines
+        line.delete(l)
+    array.clear(lines)
+
+// ─── Cycle computations ──────────────────────────────────────────────────────
+[new_nano,       nano_num,       random1] = getCycle("15S")
+[new_micro,      micro_num,      random2] = getCycle("1")
+[new_m90,        m90_num,        random3] = getCycle("5")
+[new_daily,      daily_num,      random4] = getCycle("15")
+[new_weekly,     weekly_num,     random5] = getCycle("60")
+[new_monthly,    monthly_num,    random6] = getCycle("240")
+[new_yearly,     yearly_num,     random7] = getCycle("1W")
+[new_quadrenial, quadrenial_num, random8] = getCycle("1M")
+
+// ─── Universal session-based cycle alignment ─────────────────────────────────
+// Uses time(timeframe.period, session, 'America/New_York') — TradingView's own
+// session engine resolves DST/timezone for every asset class natively, so there
+// are no per-exchange offsets to manage.  No extra security() calls needed.
+_onQ(s) => bool(math.sign(nz(time(timeframe.period, s, 'America/New_York'))))
+
+// ── Daily: four 6-hour sessions in ET ────────────────────────────────────────
+// Q1=Asia 18:00-00:00, Q2=London 00:00-06:00, Q3=NY AM 06:00-12:00, Q4=NY PM 12:00-18:00
+_dq       = _onQ('1800-0000') ? 1 : _onQ('0000-0600') ? 2 : _onQ('0600-1200') ? 3 : _onQ('1200-1800') ? 4 : 0
+new_daily := ta.change(_dq) != 0 and _dq != 0
+daily_num := _dq != 0 ? _dq : daily_num
+
+// ── Weekly: new trading day fires when daily Q1 (18:00 ET) opens ─────────────
+// This eliminates the need for any external security() reference.
+// Q1=Monday, Q2=Tuesday, Q3=Wednesday, Q4=Thursday, Q0=Friday
+new_weekly := new_daily and _dq == 1
+_het        = hour(time,      'America/New_York')
+_det        = dayofweek(time, 'America/New_York')
+weekly_num := switch
+    (_het >= 18 and _det == dayofweek.sunday)    or (_het < 18 and _det == dayofweek.monday)    => 1
+    (_het >= 18 and _det == dayofweek.monday)    or (_het < 18 and _det == dayofweek.tuesday)   => 2
+    (_het >= 18 and _det == dayofweek.tuesday)   or (_het < 18 and _det == dayofweek.wednesday) => 3
+    (_het >= 18 and _det == dayofweek.wednesday) or (_het < 18 and _det == dayofweek.thursday)  => 4
+    (_het >= 18 and _det == dayofweek.thursday)  or (_het < 18 and _det == dayofweek.friday)    => 0
+    (_het >= 18 and _det == dayofweek.friday)    or (_het < 18 and _det == dayofweek.saturday)  => 5
+    (_het >= 18 and _det == dayofweek.saturday)  or (_het < 18 and _det == dayofweek.sunday)    => 6
+    => weekly_num
+
+// ── Monthly: trading weeks begin Sunday 18:00 ET ────────────────────────────
+// Week 1 is anchored to the Sunday 18:00 ET session open at/before the first
+// calendar day of the month. This keeps 1h and lower charts aligned with 4h.
+[_new_monthly_ny, _monthly_num_ny] = getMonthlyWeekNy()
+new_monthly := _new_monthly_ny
+monthly_num := _monthly_num_ny
+
+// ── 90m: sixteen 90-minute slots per day, Q1-Q4 cycling within each 6h session
+// IDs 1-4=Asia, 5-8=London, 9-12=NY AM, 13-16=NY PM
+_m90_id   = _onQ('1800-1930') ? 1  : _onQ('1930-2100') ? 2  : _onQ('2100-2230') ? 3  : _onQ('2230-0000') ? 4  :
+             _onQ('0000-0130') ? 5  : _onQ('0130-0300') ? 6  : _onQ('0300-0430') ? 7  : _onQ ('0430-0600') ? 8  :
+             _onQ('0600-0730') ? 9  : _onQ('0730-0900') ? 10 : _onQ('0900-1030') ? 11 : _onQ ('1030-1200') ? 12 :
+             _onQ('1200-1330') ? 13 : _onQ('1330-1500') ? 14 : _onQ('1500-1630') ? 15 : _onQ ('1630-1800') ? 16 : 0
+new_m90   := ta.change(_m90_id) != 0 and _m90_id != 0
+m90_num   := _m90_id > 0 ? ((_m90_id - 1) % 4) + 1 : m90_num
+
+// ── Micro: 22.5-minute quarters within each 90-minute session ────────────────
+// Boundaries sourced from TFlab (verified against ICT framework):
+// Q1: :00-:22, Q2: :22-:45, Q3: :45-:07, Q4: :07-:30  (offset within 90-min session)
+// Computed from minutes-since-18:00 ET mod 90, no extra time() calls required.
+_met       = minute(time, 'America/New_York')
+_since18   = ((_het * 60 + _met) - 18 * 60 + 1440) % 1440  // elapsed mins since 18:00 ET
+_s90       = _since18 % 90                                   // offset within current 90-min session
+_micro_q = _dq != 0 ? (_s90 < 23 ? 1 : _s90 < 45 ? 2 : _s90 < 68 ? 3 : 4) : 0
+new_micro  := ta.change(_micro_q) != 0 and _micro_q != 0
+micro_num  := _micro_q != 0 ? _micro_q : micro_num
+
+// ─── Auto-mode ───────────────────────────────────────────────────────────────
+base_level = switch timeframe.period
+    "15S" => 0
+    "30S" => 0
+    "45S" => 0
+    "1"   => 1
+    "3"   => 1
+    "5"   => 2
+    "15"  => 3
+    "60"  => 4
+    "90"  => 4
+    "240" => 5
+    "360" => 5
+    "1D"  => 6
+    "1W"  => 7
+    "1M"  => 7
+    => 3
+
+inRange(level) => level >= base_level and level < base_level + tfs
+
+showPane        = not (showOnChart and onlyOnChart)
+show_nano       = showPane and (useManual ? showNano       : inRange(0))
+show_micro      = showPane and (useManual ? showMicro      : inRange(1))
+show_m90        = showPane and (useManual ? show90m        : inRange(2))
+show_daily      = showPane and (useManual ? showDaily      : inRange(3))
+show_weekly     = showPane and (useManual ? showWeekly     : inRange(4))
+show_monthly    = showPane and (useManual ? showMonthly    : inRange(5))
+show_yearly     = showPane and (useManual ? showYearly     : inRange(6))
+show_quadrenial = showPane and (useManual ? showQuadrenial : inRange(7))
+
+// ─── On-Chart visible flags (NOT gated by showPane) ───────────────────────────
+oc_show_nano       = showOnChart and timeframe.in_seconds(timeframe.period) <= 15       and (useManual ? showNano       : inRange(0))
+oc_show_micro      = showOnChart and timeframe.in_seconds(timeframe.period) <= 60       and (useManual ? showMicro      : inRange(1))
+oc_show_m90        = showOnChart and timeframe.in_seconds(timeframe.period) <= 300      and (useManual ? show90m        : inRange(2))
+oc_show_daily      = showOnChart and timeframe.in_seconds(timeframe.period) <= 900      and (useManual ? showDaily      : inRange(3))
+oc_show_weekly     = showOnChart and timeframe.in_seconds(timeframe.period) <= 3600     and (useManual ? showWeekly     : inRange(4))
+oc_show_monthly    = showOnChart and timeframe.in_seconds(timeframe.period) <= 14400    and (useManual ? showMonthly    : inRange(5))
+oc_show_yearly     = showOnChart and timeframe.in_seconds(timeframe.period) <= 604800   and (useManual ? showYearly     : inRange(6))
+oc_show_quadrenial = showOnChart and timeframe.in_seconds(timeframe.period) <= 2678400  and (useManual ? showQuadrenial : inRange(7))
+
+oc_num_visible = (oc_show_nano ? 1 : 0) + (oc_show_micro ? 1 : 0) + (oc_show_m90 ? 1 : 0) +
+     (oc_show_daily ? 1 : 0) + (oc_show_weekly ? 1 : 0) + (oc_show_monthly ? 1 : 0) +
+     (oc_show_yearly ? 1 : 0) + (oc_show_quadrenial ? 1 : 0)
+
+nano_bidx       = 0
+micro_bidx      = (oc_show_nano       ? 1 : 0)
+m90_bidx        = micro_bidx      + (oc_show_micro      ? 1 : 0)
+daily_bidx      = m90_bidx        + (oc_show_m90        ? 1 : 0)
+weekly_bidx     = daily_bidx      + (oc_show_daily      ? 1 : 0)
+monthly_bidx    = weekly_bidx     + (oc_show_weekly     ? 1 : 0)
+yearly_bidx     = monthly_bidx    + (oc_show_monthly    ? 1 : 0)
+quadrenial_bidx = yearly_bidx     + (oc_show_yearly     ? 1 : 0)
+
+highest_oc_new = oc_show_quadrenial ? new_quadrenial :
+     oc_show_yearly     ? new_yearly     :
+     oc_show_monthly    ? new_monthly    :
+     oc_show_weekly     ? new_weekly     :
+     oc_show_daily      ? new_daily      :
+     oc_show_m90        ? new_m90        :
+     oc_show_micro      ? new_micro      :
+     oc_show_nano       ? new_nano       : false
+
+highest_oc_num = oc_show_quadrenial ? quadrenial_num :
+     oc_show_yearly     ? yearly_num     :
+     oc_show_monthly    ? monthly_num    :
+     oc_show_weekly     ? weekly_num     :
+     oc_show_daily      ? daily_num      :
+     oc_show_m90        ? m90_num        :
+     oc_show_micro      ? micro_num      :
+     oc_show_nano       ? nano_num       : 0
+
+highest_oc_new_full = highest_oc_new and highest_oc_num == 1
+
+// ─── Sub-pane state vars ──────────────────────────────────────────────────────
+custom_quarters = true
+
+var box nano_box       = na
+var box micro_box      = na
+var box m90_box        = na
+var box daily_box      = na
+var box weekly_box     = na
+var box monthly_box    = na
+var box yearly_box     = na
+var box quadrenial_box = na
+
+new_box(int cyclenum, start_height, tf) =>
+    var box box_ = na
+    box_ := box.new(
+         left         = bar_index,
+         top          = start_height,
+         right        = bar_index,
+         bottom       = start_height - 100,
+         border_color = color.new(color.white, 80),
+         bgcolor      = cyclenum == 1 ? q1_c : cyclenum == 2 ? q2_c : cyclenum == 3 ? q3_c : cyclenum == 4 ? q4_c : q0_c,
+         text         = custom_quarters ? get_custom_cycle_txt(cyclenum, tf) : "Q" + str.tostring(cyclenum),
+         text_size    = size.tiny,
+         text_color   = textColor,
+         text_halign  = text.align_center)
+    box_
+
+// ─── Fixed lane heights ──────────────────────────────────────────────────────
+nano_y       = 700
+micro_y      = 600
+m90_y        = 500
+daily_y      = 400
+weekly_y     = 300
+monthly_y    = 200
+yearly_y     = 100
+quadrenial_y = 0
+
+// ─── Sub-pane drawing ────────────────────────────────────────────────────────
+if timeframe.in_seconds(timeframe.period) <= 15 and new_nano and show_nano
+    if not na(nano_box)
+        nano_box.set_right(bar_index)
+    nano_box := new_box(nano_num, nano_y, "15S")
+if not na(nano_box)
+    nano_box.set_right(bar_index)
+
+if timeframe.in_seconds(timeframe.period) <= 60 and new_micro and show_micro
+    if not na(micro_box)
+        micro_box.set_right(bar_index)
+    micro_box := new_box(micro_num, micro_y, "1")
+if not na(micro_box)
+    micro_box.set_right(bar_index)
+
+if timeframe.in_seconds(timeframe.period) <= 60*5 and new_m90 and show_m90
+    if not na(m90_box)
+        m90_box.set_right(bar_index)
+    m90_box := new_box(m90_num, m90_y, "5")
+if not na(m90_box)
+    m90_box.set_right(bar_index)
+
+if timeframe.in_seconds(timeframe.period) <= 60*15 and new_daily and show_daily
+    if not na(daily_box)
+        daily_box.set_right(bar_index)
+    daily_box := new_box(daily_num, daily_y, "15")
+if not na(daily_box)
+    daily_box.set_right(bar_index)
+
+if timeframe.in_seconds(timeframe.period) <= 60*60 and new_weekly and show_weekly
+    if not na(weekly_box)
+        weekly_box.set_right(bar_index)
+    weekly_box := new_box(weekly_num, weekly_y, "60")
+if not na(weekly_box)
+    weekly_box.set_right(bar_index)
+
+if timeframe.in_seconds(timeframe.period) <= 60*240 and new_monthly and show_monthly
+    if not na(monthly_box)
+        monthly_box.set_right(bar_index)
+    monthly_box := new_box(monthly_num, monthly_y, "240")
+if not na(monthly_box)
+    monthly_box.set_right(bar_index)
+
+if timeframe.in_seconds(timeframe.period) <= 60*60*24*7 and new_yearly and show_yearly
+    if not na(yearly_box)
+        yearly_box.set_right(bar_index)
+    yearly_box := new_box(yearly_num, yearly_y, "1D")
+if not na(yearly_box)
+    yearly_box.set_right(bar_index)
+
+if timeframe.in_seconds(timeframe.period) <= 60*60*24*31 and new_quadrenial and show_quadrenial
+    if not na(quadrenial_box)
+        quadrenial_box.set_right(bar_index)
+    quadrenial_box := new_box(quadrenial_num, quadrenial_y, "1W")
+if not na(quadrenial_box)
+    quadrenial_box.set_right(bar_index)
+
+// ─── On-Chart multi-cycle state ───────────────────────────────────────────────
+var box[]  oc_nano_boxes            = array.new<box>()
+var box[]  oc_micro_boxes           = array.new<box>()
+var box[]  oc_m90_boxes             = array.new<box>()
+var box[]  oc_daily_boxes           = array.new<box>()
+var box[]  oc_weekly_boxes          = array.new<box>()
+var box[]  oc_monthly_boxes         = array.new<box>()
+var box[]  oc_yearly_boxes          = array.new<box>()
+var box[]  oc_quadrenial_boxes      = array.new<box>()
+
+var box[]  oc_prev_nano_boxes       = array.new<box>()
+var box[]  oc_prev_micro_boxes      = array.new<box>()
+var box[]  oc_prev_m90_boxes        = array.new<box>()
+var box[]  oc_prev_daily_boxes      = array.new<box>()
+var box[]  oc_prev_weekly_boxes     = array.new<box>()
+var box[]  oc_prev_monthly_boxes    = array.new<box>()
+var box[]  oc_prev_yearly_boxes     = array.new<box>()
+var box[]  oc_prev_quadrenial_boxes = array.new<box>()
+
+var line[] oc_div_lines             = array.new<line>()
+var line[] oc_prev_div_lines        = array.new<line>()
+
+var float oc_cycle_high    = na
+var float oc_cycle_low     = na
+var float oc_cycle_bar_sum = 0.0
+var int   oc_cycle_bars    = 0
+
+var float prev_cycle_high  = na
+var float prev_cycle_low   = na
+var float prev_cycle_avg   = na
+
+// ─── On-Chart multi-cycle drawing logic ──────────────────────────────────────
+if showOnChart and oc_num_visible > 0
+
+    oc_cycle_high    := na(oc_cycle_high) ? high : math.max(oc_cycle_high, high)
+    oc_cycle_low     := na(oc_cycle_low)  ? low  : math.min(oc_cycle_low,  low)
+    oc_cycle_bar_sum += (high - low)
+    oc_cycle_bars    += 1
+    oc_avg            = oc_cycle_bar_sum / oc_cycle_bars
+
+    in_q1_prev    = highest_oc_num == 1 and showPrevCycle and not na(prev_cycle_high)
+    combined_high = in_q1_prev ? math.max(oc_cycle_high, prev_cycle_high) : oc_cycle_high
+    combined_low  = in_q1_prev ? math.min(oc_cycle_low,  prev_cycle_low)  : oc_cycle_low
+    combined_avg  = in_q1_prev ? math.max(oc_avg, prev_cycle_avg)         : oc_avg
+
+    band_h = combined_avg
+    lhi    = combined_high + band_h
+    llo    = combined_low  - band_h
+
+    if not in_q1_prev and not highest_oc_new_full and array.size(oc_prev_div_lines) > 0
+        oc_delete_boxes(oc_prev_nano_boxes)
+        oc_delete_boxes(oc_prev_micro_boxes)
+        oc_delete_boxes(oc_prev_m90_boxes)
+        oc_delete_boxes(oc_prev_daily_boxes)
+        oc_delete_boxes(oc_prev_weekly_boxes)
+        oc_delete_boxes(oc_prev_monthly_boxes)
+        oc_delete_boxes(oc_prev_yearly_boxes)
+        oc_delete_boxes(oc_prev_quadrenial_boxes)
+        oc_delete_lines(oc_prev_div_lines)
+
+    if oc_show_nano
+        oc_sync_band(oc_nano_boxes, nano_bidx, combined_high, band_h)
+        if array.size(oc_nano_boxes) > 0
+            array.last(oc_nano_boxes).set_right(bar_index + 1)
+    if oc_show_micro
+        oc_sync_band(oc_micro_boxes, micro_bidx, combined_high, band_h)
+        if array.size(oc_micro_boxes) > 0
+            array.last(oc_micro_boxes).set_right(bar_index + 1)
+    if oc_show_m90
+        oc_sync_band(oc_m90_boxes, m90_bidx, combined_high, band_h)
+        if array.size(oc_m90_boxes) > 0
+            array.last(oc_m90_boxes).set_right(bar_index + 1)
+    if oc_show_daily
+        oc_sync_band(oc_daily_boxes, daily_bidx, combined_high, band_h)
+        if array.size(oc_daily_boxes) > 0
+            array.last(oc_daily_boxes).set_right(bar_index + 1)
+    if oc_show_weekly
+        oc_sync_band(oc_weekly_boxes, weekly_bidx, combined_high, band_h)
+        if array.size(oc_weekly_boxes) > 0
+            array.last(oc_weekly_boxes).set_right(bar_index + 1)
+    if oc_show_monthly
+        oc_sync_band(oc_monthly_boxes, monthly_bidx, combined_high, band_h)
+        if array.size(oc_monthly_boxes) > 0
+            array.last(oc_monthly_boxes).set_right(bar_index + 1)
+    if oc_show_yearly
+        oc_sync_band(oc_yearly_boxes, yearly_bidx, combined_high, band_h)
+        if array.size(oc_yearly_boxes) > 0
+            array.last(oc_yearly_boxes).set_right(bar_index + 1)
+    if oc_show_quadrenial
+        oc_sync_band(oc_quadrenial_boxes, quadrenial_bidx, combined_high, band_h)
+        if array.size(oc_quadrenial_boxes) > 0
+            array.last(oc_quadrenial_boxes).set_right(bar_index + 1)
+
+    oc_sync_lines(oc_div_lines, lhi, llo)
+
+    if in_q1_prev
+        if oc_show_nano
+            oc_sync_band(oc_prev_nano_boxes,       nano_bidx,       combined_high, band_h)
+        if oc_show_micro
+            oc_sync_band(oc_prev_micro_boxes,      micro_bidx,      combined_high, band_h)
+        if oc_show_m90
+            oc_sync_band(oc_prev_m90_boxes,        m90_bidx,        combined_high, band_h)
+        if oc_show_daily
+            oc_sync_band(oc_prev_daily_boxes,      daily_bidx,      combined_high, band_h)
+        if oc_show_weekly
+            oc_sync_band(oc_prev_weekly_boxes,     weekly_bidx,     combined_high, band_h)
+        if oc_show_monthly
+            oc_sync_band(oc_prev_monthly_boxes,    monthly_bidx,    combined_high, band_h)
+        if oc_show_yearly
+            oc_sync_band(oc_prev_yearly_boxes,     yearly_bidx,     combined_high, band_h)
+        if oc_show_quadrenial
+            oc_sync_band(oc_prev_quadrenial_boxes, quadrenial_bidx, combined_high, band_h)
+        oc_sync_lines(oc_prev_div_lines, lhi, llo)
+
+    if highest_oc_new_full
+
+        prev_cycle_high := oc_cycle_high
+        prev_cycle_low  := oc_cycle_low
+        prev_cycle_avg  := oc_avg
+
+        oc_hand_off_boxes(oc_nano_boxes,       oc_prev_nano_boxes)
+        oc_hand_off_boxes(oc_micro_boxes,      oc_prev_micro_boxes)
+        oc_hand_off_boxes(oc_m90_boxes,        oc_prev_m90_boxes)
+        oc_hand_off_boxes(oc_daily_boxes,      oc_prev_daily_boxes)
+        oc_hand_off_boxes(oc_weekly_boxes,     oc_prev_weekly_boxes)
+        oc_hand_off_boxes(oc_monthly_boxes,    oc_prev_monthly_boxes)
+        oc_hand_off_boxes(oc_yearly_boxes,     oc_prev_yearly_boxes)
+        oc_hand_off_boxes(oc_quadrenial_boxes, oc_prev_quadrenial_boxes)
+        oc_hand_off_lines(oc_div_lines,        oc_prev_div_lines)
+
+        if not showPrevCycle
+            oc_delete_boxes(oc_prev_nano_boxes)
+            oc_delete_boxes(oc_prev_micro_boxes)
+            oc_delete_boxes(oc_prev_m90_boxes)
+            oc_delete_boxes(oc_prev_daily_boxes)
+            oc_delete_boxes(oc_prev_weekly_boxes)
+            oc_delete_boxes(oc_prev_monthly_boxes)
+            oc_delete_boxes(oc_prev_yearly_boxes)
+            oc_delete_boxes(oc_prev_quadrenial_boxes)
+            oc_delete_lines(oc_prev_div_lines)
+
+        oc_cycle_high    := high
+        oc_cycle_low     := low
+        oc_cycle_bar_sum := high - low
+        oc_cycle_bars    := 1
+        oc_avg           := high - low
+
+        combined_high := showPrevCycle ? math.max(high, prev_cycle_high) : high
+        combined_low  := showPrevCycle ? math.min(low,  prev_cycle_low)  : low
+        combined_avg  := showPrevCycle ? math.max(oc_avg, prev_cycle_avg) : oc_avg
+        band_h        := combined_avg
+        lhi           := combined_high + band_h
+        llo           := combined_low  - band_h
+
+        reset_sep = line.new(bar_index, llo, bar_index, lhi,
+             color         = divLineColor,
+             width         = divLineWidth,
+             style         = resolveLineStyle(divLineStyle),
+             force_overlay = true)
+        array.push(oc_div_lines, reset_sep)
+
+        if oc_show_nano
+            oc_create_box(oc_nano_boxes,       nano_num,       nano_bidx,       combined_high, band_h, "15S")
+        if oc_show_micro
+            oc_create_box(oc_micro_boxes,      micro_num,      micro_bidx,      combined_high, band_h, "1")
+        if oc_show_m90
+            oc_create_box(oc_m90_boxes,        m90_num,        m90_bidx,        combined_high, band_h, "5")
+        if oc_show_daily
+            oc_create_box(oc_daily_boxes,      daily_num,      daily_bidx,      combined_high, band_h, "15")
+        if oc_show_weekly
+            oc_create_box(oc_weekly_boxes,     weekly_num,     weekly_bidx,     combined_high, band_h, "60")
+        if oc_show_monthly
+            oc_create_box(oc_monthly_boxes,    monthly_num,    monthly_bidx,    combined_high, band_h, "240")
+        if oc_show_yearly
+            oc_create_box(oc_yearly_boxes,     yearly_num,     yearly_bidx,     combined_high, band_h, "1W")
+        if oc_show_quadrenial
+            oc_create_box(oc_quadrenial_boxes, quadrenial_num, quadrenial_bidx, combined_high, band_h, "1M")
+
+    else
+        if oc_show_nano and new_nano
+            oc_open_box(oc_nano_boxes,       oc_div_lines, nano_num,       nano_bidx,       combined_high, band_h, lhi, llo, "15S")
+        if oc_show_micro and new_micro
+            oc_open_box(oc_micro_boxes,      oc_div_lines, micro_num,      micro_bidx,      combined_high, band_h, lhi, llo, "1")
+        if oc_show_m90 and new_m90
+            oc_open_box(oc_m90_boxes,        oc_div_lines, m90_num,        m90_bidx,        combined_high, band_h, lhi, llo, "5")
+        if oc_show_daily and new_daily
+            oc_open_box(oc_daily_boxes,      oc_div_lines, daily_num,      daily_bidx,      combined_high, band_h, lhi, llo, "15")
+        if oc_show_weekly and new_weekly
+            oc_open_box(oc_weekly_boxes,     oc_div_lines, weekly_num,     weekly_bidx,     combined_high, band_h, lhi, llo, "60")
+        if oc_show_monthly and new_monthly
+            oc_open_box(oc_monthly_boxes,    oc_div_lines, monthly_num,    monthly_bidx,    combined_high, band_h, lhi, llo, "240")
+        if oc_show_yearly and new_yearly
+            oc_open_box(oc_yearly_boxes,     oc_div_lines, yearly_num,     yearly_bidx,     combined_high, band_h, lhi, llo, "1W")
+        if oc_show_quadrenial and new_quadrenial
+            oc_open_box(oc_quadrenial_boxes, oc_div_lines, quadrenial_num, quadrenial_bidx, combined_high, band_h, lhi, llo, "1M")
