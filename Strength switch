@@ -1,0 +1,306 @@
+
+//@version=5
+indicator("GXT Strength Switch + PSP Engine", overlay=true, max_lines_count=300, max_labels_count=200)
+
+//=====================================================================
+// 1. USER INPUTS
+//=====================================================================
+
+// Secondary correlated asset
+string groupAsset = "01 — Correlated Asset"
+string assetB = input.symbol("CME_MINI:ES1!", "Asset B — Correlated Ticker", group=groupAsset)
+bool showBLine = input.bool(true, "Show Asset B Close", group=groupAsset)
+string lineStyleInput = input.string("Step", "Asset B Line Style", options=["Step", "Continuous"], group=groupAsset)
+
+// Structural settings
+string groupStructure = "02 — Structure"
+int lookback = input.int(20, "Structural Lookback (X)", minval=2, maxval=500, group=groupStructure)
+int pivotLen = input.int(3, "Swing Pivot Confirmation Bars", minval=1, maxval=50, group=groupStructure)
+int pspWindow = input.int(10, "PSP Validity Window (bars)", minval=1, maxval=100, group=groupStructure)
+bool confirmedOnly = input.bool(true, "Trigger Only On Closed Bars", group=groupStructure)
+
+// Visual settings
+string groupVisual = "03 — Visuals"
+int pspOpacity = input.int(85, "PSP Background Transparency", minval=0, maxval=100, group=groupVisual)
+int lineWidth = input.int(2, "Divergence Line Width", minval=1, maxval=4, group=groupVisual)
+int targetWidth = input.int(1, "Target Line Width", minval=1, maxval=4, group=groupVisual)
+bool showAnchors = input.bool(true, "Show SMT Anchor Lines", group=groupVisual)
+bool showTargets = input.bool(true, "Show Asset B Liquidity Target", group=groupVisual)
+bool showPSP = input.bool(true, "Show PSP Markers", group=groupVisual)
+
+// Colors
+color cyan = color.rgb(0, 255, 255)
+color magenta = color.rgb(255, 0, 255)
+color orange = color.rgb(255, 170, 0)
+color green = color.rgb(0, 255, 0)
+color red = color.rgb(255, 0, 0)
+color slate = color.rgb(128, 128, 128)
+
+//=====================================================================
+// 2. SECONDARY ASSET DATA
+//=====================================================================
+
+// Use the chart timeframe for both assets.
+// lookahead_off avoids historical future leakage.
+// For a same-timeframe request, the current bar develops in real time.
+[bOpen, bHigh, bLow, bClose] = request.security(
+     assetB,
+     timeframe.period,
+     [open, high, low, close],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+// Asset B's own candle direction.
+bool bBull = bClose > bOpen
+bool bBear = bClose < bOpen
+
+color bLineColor = bBull ? cyan : bBear ? magenta : color.gray
+
+plot(
+     showBLine ? bClose : na,
+     title="Asset B Close",
+     color=bLineColor,
+     linewidth=1,
+     style=plot.style_stepline)
+
+//=====================================================================
+// 3. STRUCTURAL DIVERGENCE ENGINE
+//=====================================================================
+
+// Compare each asset against its own preceding X bars.
+// Current bar is excluded from the reference range.
+float aPriorHigh = ta.highest(high[1], lookback)
+float aPriorLow = ta.lowest(low[1], lookback)
+
+float bPriorHigh = ta.highest(bHigh[1], lookback)
+float bPriorLow = ta.lowest(bLow[1], lookback)
+
+// Bearish switch:
+// A breaks above its preceding range.
+// B fails to break above its own preceding range.
+bool bearishStructureRaw =
+     high > aPriorHigh and
+     bHigh <= bPriorHigh
+
+// Bullish switch:
+// A breaks below its preceding range.
+// B fails to break below its own preceding range.
+bool bullishStructureRaw =
+     low < aPriorLow and
+     bLow >= bPriorLow
+
+bool barAllowed = not confirmedOnly or barstate.isconfirmed
+
+bool bearishStructure = bearishStructureRaw and barAllowed
+bool bullishStructure = bullishStructureRaw and barAllowed
+
+// Track the most recent structural event.
+var int lastBearStructureBar = na
+var int lastBullStructureBar = na
+
+if bearishStructure
+    lastBearStructureBar := bar_index
+
+if bullishStructure
+    lastBullStructureBar := bar_index
+
+bool bearishWindow =
+     not na(lastBearStructureBar) and
+     bar_index - lastBearStructureBar <= pspWindow
+
+bool bullishWindow =
+     not na(lastBullStructureBar) and
+     bar_index - lastBullStructureBar <= pspWindow
+
+//=====================================================================
+// 4. STRUCTURAL ANCHOR POINTS
+//=====================================================================
+
+// The lookback extreme is the reference anchor.
+// These are range anchors, not confirmed swing pivots.
+int aHighOffset = math.abs(ta.highestbars(high[1], lookback)) + 1
+int aLowOffset = math.abs(ta.lowestbars(low[1], lookback)) + 1
+
+int bHighOffset = math.abs(ta.highestbars(bHigh[1], lookback)) + 1
+int bLowOffset = math.abs(ta.lowestbars(bLow[1], lookback)) + 1
+
+// Keep the most recent line objects to control object usage.
+var line[] anchorLines = array.new_line()
+
+f_addAnchor(int x1, float y1, int x2, float y2) =>
+    line newLine = line.new(
+         x1=x1, y1=y1,
+         x2=x2, y2=y2,
+         xloc=xloc.bar_index,
+         extend=extend.none,
+         color=orange,
+         style=line.style_dashed,
+         width=lineWidth)
+    array.push(anchorLines, newLine)
+    if array.size(anchorLines) > 100
+        line.delete(array.shift(anchorLines))
+
+if showAnchors and bearishStructure
+    f_addAnchor(
+         bar_index - aHighOffset, high[aHighOffset],
+         bar_index, high)
+
+    f_addAnchor(
+         bar_index - bHighOffset, bHigh[bHighOffset],
+         bar_index, bHigh)
+
+if showAnchors and bullishStructure
+    f_addAnchor(
+         bar_index - aLowOffset, low[aLowOffset],
+         bar_index, low)
+
+    f_addAnchor(
+         bar_index - bLowOffset, bLow[bLowOffset],
+         bar_index, bLow)
+
+//=====================================================================
+// 5. PRECISION SWING POINT — PSP
+//=====================================================================
+
+// Strictly asymmetric candle directions.
+// Dojis do not qualify.
+bool bullishPSPRaw =
+     bullishWindow and
+     close > open and
+     bClose < bOpen
+
+bool bearishPSPRaw =
+     bearishWindow and
+     close < open and
+     bClose > bOpen
+
+bool bullishPSP = bullishPSPRaw and barAllowed
+bool bearishPSP = bearishPSPRaw and barAllowed
+
+// Highlight the chart background.
+bgcolor(
+     bullishPSP ? color.new(green, pspOpacity) :
+     bearishPSP ? color.new(red, pspOpacity) :
+     na,
+     title="PSP Trigger Background")
+
+// PSP markers.
+plotshape(
+     showPSP and bullishPSP,
+     title="Bullish PSP",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=green,
+     size=size.small)
+
+plotshape(
+     showPSP and bearishPSP,
+     title="Bearish PSP",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=red,
+     size=size.small)
+
+//=====================================================================
+// 6. OPPOSING LIQUIDITY TARGETS — ASSET B
+//=====================================================================
+
+// Confirmed pivots are only known pivotLen bars after their
+// actual occurrence. Their prices are not available beforehand.
+float bPivotHigh = ta.pivothigh(bHigh, pivotLen, pivotLen)
+float bPivotLow = ta.pivotlow(bLow, pivotLen, pivotLen)
+
+var float latestBHigh = na
+var float latestBLow = na
+var int latestBHighBar = na
+var int latestBLowBar = na
+
+if not na(bPivotHigh)
+    latestBHigh := bPivotHigh
+    latestBHighBar := bar_index - pivotLen
+
+if not na(bPivotLow)
+    latestBLow := bPivotLow
+    latestBLowBar := bar_index - pivotLen
+
+// A bullish PSP projects toward the latest confirmed Asset B swing high.
+// A bearish PSP projects toward the latest confirmed Asset B swing low.
+var line targetLine = na
+var float activeTarget = na
+var int activeTargetDirection = 0
+
+bool newTargetSignal = bullishPSP or bearishPSP
+
+if showTargets and newTargetSignal
+    float proposedTarget = bullishPSP ? latestBHigh : latestBLow
+    int proposedDirection = bullishPSP ? 1 : -1
+
+    bool targetExists = not na(proposedTarget)
+
+    // Only project a target ahead of Asset B's current price.
+    bool targetAhead =
+         targetExists and
+         (proposedDirection == 1 ? proposedTarget > bClose :
+          proposedTarget < bClose)
+
+    if targetAhead
+        if not na(targetLine)
+            line.delete(targetLine)
+
+        activeTarget := proposedTarget
+        activeTargetDirection := proposedDirection
+
+        targetLine := line.new(
+             x1=bar_index,
+             y1=activeTarget,
+             x2=bar_index + 1,
+             y2=activeTarget,
+             xloc=xloc.bar_index,
+             extend=extend.right,
+             color=slate,
+             style=line.style_dotted,
+             width=targetWidth)
+
+// Terminate the target when Asset B reaches its projected level.
+bool targetHit =
+     not na(activeTarget) and
+     (activeTargetDirection == 1 ?
+         bHigh >= activeTarget :
+         bLow <= activeTarget)
+
+if targetHit
+    if not na(targetLine)
+        line.set_extend(targetLine, extend.none)
+        line.set_x2(targetLine, bar_index)
+    activeTarget := na
+    activeTargetDirection := 0
+    targetLine := na
+
+//=====================================================================
+// 7. ALERTS
+//=====================================================================
+
+alertcondition(
+     bullishStructure,
+     title="Bullish Strength Switch SMT",
+     message="Bullish Strength Switch SMT detected.")
+
+alertcondition(
+     bearishStructure,
+     title="Bearish Strength Switch SMT",
+     message="Bearish Strength Switch SMT detected.")
+
+alertcondition(
+     bullishPSP,
+     title="Bullish PSP",
+     message="Bullish PSP confirmed inside the structural window.")
+
+alertcondition(
+     bearishPSP,
+     title="Bearish PSP",
+     message="Bearish PSP confirmed inside the structural window.")
+
+alertcondition(
+     targetHit,
+     title="Asset B Liquidity Target Hit",
+     message="Asset B has reached the projected liquidity target.")
